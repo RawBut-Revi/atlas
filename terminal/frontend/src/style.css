@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@theme {
+  --color-atlas-bg: #0d1117;
+  --color-atlas-surface: #161b22;
+  --color-atlas-border: #30363d;
+  --color-atlas-text: #c9d1d9;
+  --color-atlas-text-dim: #8b949e;
+  --color-atlas-accent: #58a6ff;
+  --color-atlas-green: #3fb950;
+  --color-atlas-red: #f85149;
+  --color-atlas-orange: #d29922;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background-color: var(--color-atlas-bg);
+  color: var(--color-atlas-text);
+  font-family: var(--font-mono);
+  overflow: hidden;
+  user-select: none;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-atlas-bg);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-atlas-border);
+  border-radius: 3px;
+}

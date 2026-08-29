@@ -1,0 +1,10 @@
+duckdb>=1.1.0
+ollama>=0.4.0
+python-dateutil>=2.9.0
+pandas>=2.2.0
+numpy>=1.26.0
+yfinance>=0.2.40
+jupyterlab>=4.2.0
+fastapi>=0.115.0
+uvicorn>=0.34.0
+groq>=0.15.0
