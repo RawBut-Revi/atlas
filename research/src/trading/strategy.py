@@ -1,26 +1,27 @@
 """
 Project Atlas — Quantitative Trading Strategy Engine
-
-Combines:
-  1. Connors RSI(2) Mean Reversion on Pullbacks (High Precision)
-  2. EMA(50) & EMA(20) Macro Trend Filter
-  3. Volume Surge Confirmation (Institutions)
-  4. ATR-based Dynamic Stop-Loss and Target (1:1.5 Risk-to-Reward)
+Dual-mode: Runs with pandas if available, OR pure Python lists (zero dependencies for Termux/mobile).
 """
 
-import pandas as pd
-import numpy as np
 from dataclasses import dataclass
 from typing import Optional
 
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+
 from .indicators import (
+    calculate_rsi_pure,
+    calculate_ema_pure,
+    calculate_atr_pure,
+    calculate_volume_ratio_pure,
     calculate_rsi,
     calculate_ema,
-    calculate_vwap,
-    calculate_macd,
-    calculate_bollinger_bands,
-    calculate_volume_ratio,
     calculate_atr,
+    calculate_volume_ratio,
+    calculate_bollinger_bands,
 )
 
 
@@ -56,35 +57,45 @@ class TradeSignal:
         }
 
 
-def generate_signal(symbol: str, df: pd.DataFrame) -> TradeSignal:
+def generate_signal(symbol: str, df) -> TradeSignal:
     """
     Generate quantitative trade signal for a given stock based on historical candles.
+    Supports both pandas DataFrame and standard list-of-dicts.
     """
     if df is None or len(df) < 50:
         return _empty_signal(symbol)
 
-    rsi2 = calculate_rsi(df, period=2)
-    rsi14 = calculate_rsi(df, period=14)
-    ema20 = calculate_ema(df["close"], 20)
-    ema50 = calculate_ema(df["close"], 50)
-    macd_line, signal_line, _ = calculate_macd(df)
-    vol_ratio = calculate_volume_ratio(df)
-    atr = calculate_atr(df)
-    bb_upper, bb_mid, bb_lower = calculate_bollinger_bands(df)
-
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
-    price = curr["close"]
-
-    r2 = rsi2.iloc[-1]
-    r14 = rsi14.iloc[-1]
-    e20 = ema20.iloc[-1]
-    e50 = ema50.iloc[-1]
-    v_rat = vol_ratio.iloc[-1] if not pd.isna(vol_ratio.iloc[-1]) else 1.0
-    curr_atr = atr.iloc[-1] if not pd.isna(atr.iloc[-1]) else price * 0.015
-
-    if any(pd.isna(x) for x in [r2, r14, e20, e50, price]):
+    if HAS_PANDAS and isinstance(df, pd.DataFrame):
+        closes = list(df["close"])
+        highs = list(df["high"])
+        lows = list(df["low"])
+        volumes = list(df["volume"])
+    elif isinstance(df, list):
+        closes = [r["close"] for r in df]
+        highs = [r["high"] for r in df]
+        lows = [r["low"] for r in df]
+        volumes = [r["volume"] for r in df]
+    else:
         return _empty_signal(symbol)
+
+    price = closes[-1]
+    prev_high = highs[-2]
+    prev_low = lows[-2]
+
+    # Calculate indicators (pure Python / vectorized)
+    rsi2_list = calculate_rsi_pure(closes, period=2)
+    rsi14_list = calculate_rsi_pure(closes, period=14)
+    ema20_list = calculate_ema_pure(closes, 20)
+    ema50_list = calculate_ema_pure(closes, 50)
+    curr_atr = calculate_atr_pure(highs, lows, closes, 14)
+    v_rat = calculate_volume_ratio_pure(volumes, 20)
+
+    r2 = rsi2_list[-1]
+    r14 = rsi14_list[-1]
+    e20 = ema20_list[-1]
+    e50 = ema50_list[-1]
+    if curr_atr <= 0:
+        curr_atr = price * 0.015
 
     # Trend Determination
     if price > e50 and e20 > e50:
@@ -94,16 +105,13 @@ def generate_signal(symbol: str, df: pd.DataFrame) -> TradeSignal:
     else:
         trend = "SIDEWAYS"
 
-    # Strategy 1: High-Probability Pullback in Trend
-    # BUY: In Bullish Trend, extreme short-term pullback (RSI2 <= 15 or price near BB Lower)
-    is_pullback_buy = (trend == "BULLISH" or price > e50) and (r2 <= 20 or price <= bb_lower.iloc[-1] * 1.01)
-    
-    # SELL: In Bearish Trend, extreme short-term rally (RSI2 >= 80 or price near BB Upper)
-    is_pullback_sell = (trend == "BEARISH" or price < e50) and (r2 >= 80 or price >= bb_upper.iloc[-1] * 0.99)
+    # Strategy 1: High-Probability Pullback in Trend (Connors RSI)
+    is_pullback_buy = (trend == "BULLISH" or price > e50) and (r2 <= 20)
+    is_pullback_sell = (trend == "BEARISH" or price < e50) and (r2 >= 80)
 
     # Strategy 2: Momentum Volume Breakout
-    is_breakout_buy = (price > prev["high"]) and (v_rat >= 1.2) and (r14 >= 55) and (trend == "BULLISH")
-    is_breakout_sell = (price < prev["low"]) and (v_rat >= 1.2) and (r14 <= 45) and (trend == "BEARISH")
+    is_breakout_buy = (price > prev_high) and (v_rat >= 1.2) and (r14 >= 55) and (trend == "BULLISH")
+    is_breakout_sell = (price < prev_low) and (v_rat >= 1.2) and (r14 <= 45) and (trend == "BEARISH")
 
     direction = "NONE"
     confidence = 0

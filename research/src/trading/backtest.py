@@ -5,8 +5,13 @@ Runs the multi-confluence strategy on historical data to validate
 performance before paper/live trading.
 """
 
-import pandas as pd
-import numpy as np
+try:
+    import pandas as pd
+    import numpy as np
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
@@ -125,6 +130,10 @@ def fetch_historical_data(
                 "close": float(c[4]),
                 "volume": int(c[5]),
             })
+
+        if not HAS_PANDAS:
+            rows.sort(key=lambda x: x["timestamp"])
+            return rows
 
         df = pd.DataFrame(rows)
         df = df.sort_values("timestamp").reset_index(drop=True)
