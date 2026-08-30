@@ -188,7 +188,37 @@ class TradingDaemon:
                 )
             return "\n".join(lines)
 
-        return "Commands: /status, /positions, /pnl, /scan, /gaps, /currency, /commodities"
+        elif cmd in ("/patterns", "/chart"):
+            from trading.patterns import analyze_3hour_patterns
+            today = datetime.now().strftime("%Y-%m-%d")
+            from_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
+
+            lines = ["🕯️ <b>3-HOUR (3H) PATTERN SCANNER</b>\n━━━━━━━━━━━━━━━━━━━"]
+            found_count = 0
+            
+            for sym in list(NSE_UNIVERSE.keys())[:40]:  # Top 40 liquid stocks
+                try:
+                    df = fetch_historical_data(sym, from_date, today)
+                    if df is not None and len(df) >= 30:
+                        res = analyze_3hour_patterns(sym, df)
+                        all_p = res.candlestick_patterns + res.chart_patterns
+                        if all_p and res.bias != "NEUTRAL":
+                            found_count += 1
+                            icon = "🟢" if res.bias == "BULLISH" else "🔴"
+                            lines.append(
+                                f"{icon} <b>{sym}</b> [{res.bias}] (+{res.confidence_boost}% boost)\n"
+                                f"  Patterns: <code>{', '.join(all_p)}</code>\n"
+                            )
+                            if found_count >= 8:
+                                break
+                except Exception:
+                    continue
+
+            if found_count == 0:
+                lines.append("No active 3-Hour reversal patterns found currently.")
+            return "\n".join(lines)
+
+        return "Commands: /status, /positions, /pnl, /scan, /gaps, /currency, /commodities, /patterns"
 
     def scan_universe(self) -> list[dict]:
         """Scans all stocks in universe in parallel and finds high-confidence setups."""

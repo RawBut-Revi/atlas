@@ -1,6 +1,12 @@
 """
 Project Atlas — Quantitative Trading Strategy Engine
 Dual-mode: Runs with pandas if available, OR pure Python lists (zero dependencies for Termux/mobile).
+Integrates:
+  1. Connors RSI(2) Mean Reversion on Pullbacks
+  2. EMA(50) & EMA(20) Macro Trend Filter
+  3. 3-Hour Candlestick & Geometric Chart Pattern Recognition (Confluence Multiplier)
+  4. Volume Surge Confirmation (Institutions)
+  5. ATR-based Dynamic Stop-Loss and Target (1:1.5 Risk-to-Reward)
 """
 
 from dataclasses import dataclass
@@ -17,19 +23,15 @@ from .indicators import (
     calculate_ema_pure,
     calculate_atr_pure,
     calculate_volume_ratio_pure,
-    calculate_rsi,
-    calculate_ema,
-    calculate_atr,
-    calculate_volume_ratio,
-    calculate_bollinger_bands,
 )
+from .patterns import analyze_3hour_patterns
 
 
 @dataclass
 class TradeSignal:
     symbol: str
-    direction: str  # "BUY", "SELL", or "NONE"
-    confidence: int  # 0 to 100
+    direction: str         # "BUY", "SELL", or "NONE"
+    confidence: int        # 0 to 100
     entry_price: float
     stop_loss: float
     target_price: float
@@ -37,8 +39,9 @@ class TradeSignal:
     rationale: str
     rsi2_value: float
     rsi14_value: float
-    trend: str  # "BULLISH", "BEARISH", "SIDEWAYS"
+    trend: str             # "BULLISH", "BEARISH", "SIDEWAYS"
     atr_value: float
+    pattern_3h: str = ""   # 3-Hour Candlestick/Chart Pattern
 
     def to_dict(self) -> dict:
         return {
@@ -54,13 +57,14 @@ class TradeSignal:
             "rsi14": round(self.rsi14_value, 1),
             "trend": self.trend,
             "atr": round(self.atr_value, 2),
+            "pattern_3h": self.pattern_3h,
         }
 
 
 def generate_signal(symbol: str, df) -> TradeSignal:
     """
     Generate quantitative trade signal for a given stock based on historical candles.
-    Supports both pandas DataFrame and standard list-of-dicts.
+    Evaluates indicators + 3-Hour Candlestick & Chart Patterns.
     """
     if df is None or len(df) < 50:
         return _empty_signal(symbol)
@@ -82,7 +86,7 @@ def generate_signal(symbol: str, df) -> TradeSignal:
     prev_high = highs[-2]
     prev_low = lows[-2]
 
-    # Calculate indicators (pure Python / vectorized)
+    # Calculate indicators
     rsi2_list = calculate_rsi_pure(closes, period=2)
     rsi14_list = calculate_rsi_pure(closes, period=14)
     ema20_list = calculate_ema_pure(closes, 20)
@@ -96,6 +100,10 @@ def generate_signal(symbol: str, df) -> TradeSignal:
     e50 = ema50_list[-1]
     if curr_atr <= 0:
         curr_atr = price * 0.015
+
+    # 3-Hour Candlestick & Chart Pattern Analysis
+    pat_res = analyze_3hour_patterns(symbol, df)
+    pattern_desc = pat_res.pattern_description if pat_res.candlestick_patterns or pat_res.chart_patterns else ""
 
     # Trend Determination
     if price > e50 and e20 > e50:
@@ -113,6 +121,10 @@ def generate_signal(symbol: str, df) -> TradeSignal:
     is_breakout_buy = (price > prev_high) and (v_rat >= 1.2) and (r14 >= 55) and (trend == "BULLISH")
     is_breakout_sell = (price < prev_low) and (v_rat >= 1.2) and (r14 <= 45) and (trend == "BEARISH")
 
+    # Strategy 3: 3H Chart Pattern Breakout
+    is_pattern_buy = pat_res.bias == "BULLISH" and len(pat_res.candlestick_patterns + pat_res.chart_patterns) > 0 and r14 >= 45
+    is_pattern_sell = pat_res.bias == "BEARISH" and len(pat_res.candlestick_patterns + pat_res.chart_patterns) > 0 and r14 <= 55
+
     direction = "NONE"
     confidence = 0
     rationale = "No high-probability setup currently"
@@ -125,6 +137,10 @@ def generate_signal(symbol: str, df) -> TradeSignal:
         direction = "BUY"
         confidence = 82
         rationale = f"Volume breakout above previous high (Vol: {v_rat:.1f}x avg)"
+    elif is_pattern_buy:
+        direction = "BUY"
+        confidence = 80 + pat_res.confidence_boost
+        rationale = f"3H Pattern confirmation: {pattern_desc}"
     elif is_pullback_sell:
         direction = "SELL"
         confidence = 88 if r2 >= 90 else 78
@@ -133,6 +149,20 @@ def generate_signal(symbol: str, df) -> TradeSignal:
         direction = "SELL"
         confidence = 82
         rationale = f"Volume breakdown below previous low (Vol: {v_rat:.1f}x avg)"
+    elif is_pattern_sell:
+        direction = "SELL"
+        confidence = 80 + pat_res.confidence_boost
+        rationale = f"3H Pattern confirmation: {pattern_desc}"
+
+    # Apply 3H Pattern Confluence Boost if pattern aligns with trade direction
+    if direction == "BUY" and pat_res.bias == "BULLISH":
+        confidence = min(95, confidence + pat_res.confidence_boost)
+        if pattern_desc:
+            rationale += f" | 3H: {pattern_desc}"
+    elif direction == "SELL" and pat_res.bias == "BEARISH":
+        confidence = min(95, confidence + pat_res.confidence_boost)
+        if pattern_desc:
+            rationale += f" | 3H: {pattern_desc}"
 
     if direction == "NONE":
         return TradeSignal(
@@ -148,6 +178,7 @@ def generate_signal(symbol: str, df) -> TradeSignal:
             rsi14_value=r14,
             trend=trend,
             atr_value=curr_atr,
+            pattern_3h=pattern_desc,
         )
 
     # Risk-Reward 1:1.5 with ATR
@@ -174,6 +205,7 @@ def generate_signal(symbol: str, df) -> TradeSignal:
         rsi14_value=r14,
         trend=trend,
         atr_value=curr_atr,
+        pattern_3h=pattern_desc,
     )
 
 
@@ -191,4 +223,5 @@ def _empty_signal(symbol: str) -> TradeSignal:
         rsi14_value=50.0,
         trend="UNKNOWN",
         atr_value=0.0,
+        pattern_3h="",
     )
