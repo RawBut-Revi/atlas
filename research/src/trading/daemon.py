@@ -442,6 +442,8 @@ class TradingDaemon:
         print("==================================================")
 
         from datetime import time as dt_time
+        WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        heartbeat_counter = 0
 
         while self.is_running:
             try:
@@ -452,76 +454,104 @@ class TradingDaemon:
                 now_time = now_ist.time()
                 weekday = now_ist.weekday()
                 is_weekday = weekday < 5
+                time_str = now_ist.strftime("%H:%M:%S")
+                heartbeat_counter += 1
 
                 if not is_weekday:
-                    # Weekend: just poll commands
+                    # Weekend
+                    if heartbeat_counter % 6 == 1:  # Print every ~60s
+                        days_to_monday = (7 - weekday) % 7
+                        if days_to_monday == 0:
+                            days_to_monday = 7
+                        print(f"[{time_str}] Market closed (Weekend - {WEEKDAYS[weekday]}). Next session: Monday 09:00 AM IST. Listening for Telegram commands...")
+                    time.sleep(10)
+                    continue
+
+                # ─── Before Market: 00:00 – 9:00 AM ──────────────────
+                if now_time < CURRENCY_OPEN:
+                    if heartbeat_counter % 6 == 1:
+                        print(f"[{time_str}] Waiting for market open at 09:00 AM IST. Listening for Telegram commands...")
                     time.sleep(10)
                     continue
 
                 # ─── 9:00 AM – 9:15 AM: Currency Pre-Market Scan ─────
-                if CURRENCY_OPEN <= now_time < MARKET_OPEN:
+                elif CURRENCY_OPEN <= now_time < MARKET_OPEN:
                     self.daily_report_sent = False
                     self.gap_scanned_today = False
                     self.currency_square_off_done = False
+                    print(f"\n[{time_str}] >> CURRENCY PRE-MARKET WINDOW (09:00-09:15)")
                     self.run_currency_scan()
+                    next_phase = "Gap Opening Detection at 09:15"
+                    print(f"[{time_str}] Next: {next_phase}. Sleeping {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
                 # ─── 9:15 AM – 9:30 AM: Gap Opening + First Equity Scan ──
                 elif MARKET_OPEN <= now_time < dt_time(9, 30):
+                    print(f"\n[{time_str}] >> GAP OPENING + EQUITY SCAN WINDOW (09:15-09:30)")
                     self.run_gap_scan()
                     self.run_scan_cycle()
+                    print(f"[{time_str}] Next scan in {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
                 # ─── 9:30 AM – 3:15 PM: Regular Equity + Currency Scans ──
                 elif dt_time(9, 30) <= now_time <= MARKET_CLOSE:
+                    state = self.load_state()
+                    open_count = len(state.get("open_positions", []))
+                    print(f"\n[{time_str}] >> INTRADAY SCAN (Equities + Currency) | Open Positions: {open_count}")
                     self.run_scan_cycle()
-                    # Also check currency every other cycle
                     if CURRENCY_OPEN <= now_time <= CURRENCY_CLOSE:
                         self.run_currency_scan()
+                    print(f"[{time_str}] Next scan in {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
                 # ─── 3:15 PM – 3:25 PM: Equity Square-Off Window ─────
                 elif MARKET_CLOSE < now_time <= SQUARE_OFF:
+                    print(f"\n[{time_str}] >> EQUITY SQUARE-OFF WINDOW (15:15-15:25)")
                     state = self.load_state()
                     equity_positions = [p for p in state.get("open_positions", []) if p.get("asset_type", "EQUITY") == "EQUITY"]
                     if equity_positions:
-                        print("[Daemon] 3:15 PM: Squaring off EQUITY positions...")
-                        # Square off only equity positions
+                        print(f"[{time_str}] Squaring off {len(equity_positions)} EQUITY position(s)...")
                         remaining = [p for p in state.get("open_positions", []) if p.get("asset_type") == "CURRENCY"]
                         for p in equity_positions:
                             self._close_position(state, p, "SQUARE_OFF")
                         state["open_positions"] = remaining
                         self.save_state(state)
+                    else:
+                        print(f"[{time_str}] No equity positions to square off.")
+                    print(f"[{time_str}] Currency trading continues until 16:45...")
                     time.sleep(60)
 
                 # ─── 3:25 PM – 4:45 PM: Currency-Only Trading Window ─
                 elif SQUARE_OFF < now_time <= CURRENCY_SQUARE_OFF:
                     if not self.currency_square_off_done:
+                        print(f"\n[{time_str}] >> CURRENCY-ONLY WINDOW (15:25-16:45)")
                         self.run_currency_scan()
-                        # Manage currency positions
                         state = self.load_state()
                         self.manage_open_positions(state)
+                        print(f"[{time_str}] Next currency scan in {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
                 # ─── 4:45 PM – 5:00 PM: Currency Square-Off & Daily Report ──
                 elif CURRENCY_SQUARE_OFF < now_time <= CURRENCY_CLOSE and not self.daily_report_sent:
+                    print(f"\n[{time_str}] >> END OF DAY — FINAL SQUARE-OFF & REPORT")
                     state = self.load_state()
-                    # Square off all remaining (currency) positions
                     if state.get("open_positions"):
-                        print("[Daemon] 4:45 PM: Squaring off ALL remaining positions...")
+                        print(f"[{time_str}] Squaring off {len(state['open_positions'])} remaining position(s)...")
                         self.square_off_all(state)
                     self.currency_square_off_done = True
 
-                    # Send daily summary
                     summary = self.risk_manager.get_daily_summary()
                     summary["total_pnl"] = state.get("total_pnl", 0.0)
                     self.notifier.notify_daily_summary(summary)
                     self.daily_report_sent = True
-                    print("[Daemon] Daily session concluded. Summary sent to Telegram.")
+                    print(f"[{time_str}] Daily session concluded. P&L summary sent to Telegram.")
+                    print(f"[{time_str}] Bot will resume tomorrow at 09:00 AM IST.")
                     time.sleep(60)
 
                 else:
-                    # Off-market hours
+                    # After market close (5:00 PM+)
+                    if heartbeat_counter % 6 == 1:
+                        print(f"[{time_str}] Market closed for today. Next session: Tomorrow 09:00 AM IST. Listening for Telegram commands...")
                     time.sleep(10)
 
             except KeyboardInterrupt:
