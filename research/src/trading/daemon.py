@@ -24,6 +24,10 @@ from trading.currency_strategy import (
     scan_all_currency_pairs, CURRENCY_PAIRS,
     CURRENCY_OPEN, CURRENCY_CLOSE, CURRENCY_SQUARE_OFF,
 )
+from trading.commodity_strategy import (
+    scan_all_commodities, get_all_commodity_telemetry,
+    COMMODITY_SPECS, MCX_OPEN, MCX_US_SESSION_OPEN, MCX_CLOSE, MCX_SQUARE_OFF,
+)
 
 IST = pytz.timezone("Asia/Kolkata")
 JOURNAL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "paper_positions.json")
@@ -65,12 +69,13 @@ class TradingDaemon:
         if cmd == "/status":
             now_ist = datetime.now(IST).strftime("%H:%M:%S IST")
             return (
-                f"🤖 <b>ATLAS BOT STATUS</b>\n"
+                f"🤖 <b>ATLAS MULTI-ASSET BOT STATUS</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
                 f"⏱️ <b>Time:</b> {now_ist}\n"
                 f"🟢 <b>Status:</b> RUNNING ({self.mode} MODE)\n"
                 f"📊 <b>Equities:</b> {len(NSE_UNIVERSE)} NSE Stocks\n"
                 f"💱 <b>Currency:</b> {len(CURRENCY_PAIRS)} FX Pairs (USD/EUR/GBP/JPY)\n"
+                f"🛢️ <b>Commodities:</b> {len(COMMODITY_SPECS)} MCX Assets (Crude/Gas/Gold/Silver/Copper)\n"
                 f"⚡ <b>Gap Scanner:</b> {'Done' if self.gap_scanned_today else 'Pending (runs at 9:15 AM)'}\n"
                 f"💼 <b>Capital:</b> INR {state.get('capital', 10000):,.2f}\n"
                 f"⚡ <b>Open Positions:</b> {len(state.get('open_positions', []))}\n"
@@ -85,8 +90,16 @@ class TradingDaemon:
             lines = ["⚡ <b>ACTIVE POSITIONS</b>\n━━━━━━━━━━━━━━━━━━━"]
             for p in open_pos:
                 asset_type = p.get("asset_type", "EQUITY")
-                tag = "💱" if asset_type == "CURRENCY" else "📊"
-                qty_label = f"Lots: {p.get('lots', p.get('qty'))}" if asset_type == "CURRENCY" else f"Qty: {p['qty']}"
+                if asset_type == "COMMODITY":
+                    tag = "🛢️"
+                    qty_label = f"Lots: {p.get('lots', 1)}"
+                elif asset_type == "CURRENCY":
+                    tag = "💱"
+                    qty_label = f"Lots: {p.get('lots', 1)}"
+                else:
+                    tag = "📊"
+                    qty_label = f"Qty: {p.get('qty', 10)}"
+
                 lines.append(
                     f"{tag} <b>{p['symbol']}</b> ({p['direction']}) | {qty_label}\n"
                     f"  Entry: {p['entry_price']} | Target: {p['target_price']} | SL: {p['stop_loss']}"
@@ -152,7 +165,30 @@ class TradingDaemon:
                 )
             return "\n".join(lines)
 
-        return "Commands: /status, /positions, /pnl, /scan, /gaps, /currency"
+        elif cmd in ("/commodities", "/mcx"):
+            telemetry = get_all_commodity_telemetry()
+            if not telemetry:
+                return "Unable to fetch MCX commodity data."
+
+            lines = ["🛢️ <b>MCX COMMODITY FUTURES</b>\n━━━━━━━━━━━━━━━━━━━"]
+            for s in telemetry:
+                if s["direction"] == "BUY":
+                    badge = f"🟢 <b>BUY ({s['strategy']})</b>"
+                elif s["direction"] == "SELL":
+                    badge = f"🔴 <b>SELL ({s['strategy']})</b>"
+                else:
+                    badge = "⚪ <b>NEUTRAL (Range)</b>"
+
+                lines.append(
+                    f"🔥 <b>{s['symbol']}</b> ({s['name']}): ₹{s['entry_price']:,.1f}\n"
+                    f"  {badge} [{s['session']}]\n"
+                    f"  🎯 Target: ₹{s['target_price']:,.1f} | 🛑 SL: ₹{s['stop_loss']:,.1f}\n"
+                    f"  📦 Lots: {s['lots']} | 🛡️ Risk: ₹{s['risk_inr']:.0f} | 🎯 Conf: {s['confidence']}%\n"
+                    f"  💡 <i>{s['rationale']}</i>\n"
+                )
+            return "\n".join(lines)
+
+        return "Commands: /status, /positions, /pnl, /scan, /gaps, /currency, /commodities"
 
     def scan_universe(self) -> list[dict]:
         """Scans all stocks in universe in parallel and finds high-confidence setups."""
@@ -435,20 +471,65 @@ class TradingDaemon:
         else:
             print("[Daemon] No actionable currency setups.")
 
+    def run_commodity_scan(self):
+        """Scans MCX commodity futures for trading setups."""
+        state = self.load_state()
+        print(f"\n[Daemon] [{datetime.now().strftime('%H:%M:%S')}] Scanning MCX Commodities ({len(COMMODITY_SPECS)} assets)...")
+
+        commodity_positions = [p for p in state.get("open_positions", []) if p.get("asset_type") == "COMMODITY"]
+        if len(commodity_positions) >= 2:
+            print("[Daemon] Max commodity positions (2) reached. Monitoring.")
+            return
+
+        commodity_signals = scan_all_commodities()
+        if commodity_signals:
+            print(f"[Daemon] Found {len(commodity_signals)} commodity setups!")
+            for sig in commodity_signals[:1]:
+                if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
+                    continue
+
+                self.notifier.notify_signal_found(sig)
+
+                pos_id = f"mcx_{int(time.time()*1000)}"
+                new_pos = {
+                    "id": pos_id,
+                    "symbol": sig["symbol"],
+                    "name": sig.get("name", sig["symbol"]),
+                    "direction": sig["direction"],
+                    "lots": sig["lots"],
+                    "qty": sig["lots"],
+                    "entry_price": sig["entry_price"],
+                    "stop_loss": sig["stop_loss"],
+                    "target_price": sig["target_price"],
+                    "mode": self.mode,
+                    "asset_type": "COMMODITY",
+                    "strategy": sig["strategy"],
+                    "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "OPEN",
+                }
+                state.setdefault("open_positions", []).append(new_pos)
+                self.save_state(state)
+                self.notifier.notify_trade_executed(new_pos)
+                print(f"[Daemon] MCX: {sig['direction']} {sig['lots']} lot(s) {sig['symbol']} @ ₹{sig['entry_price']:,.1f}")
+        else:
+            print("[Daemon] No actionable commodity setups.")
+
     def run(self):
-        """Main daemon loop — Extended hours: 9:00 AM to 5:00 PM IST."""
+        """Main daemon loop — Multi-Asset Schedule: 9:00 AM to 11:30 PM IST."""
         print("==================================================")
-        print("   PROJECT ATLAS — AUTONOMOUS TRADING DAEMON v2   ")
-        print(f"   Equities: {len(NSE_UNIVERSE)} Stocks | FX: {len(CURRENCY_PAIRS)} Pairs")
+        print("   PROJECT ATLAS — AUTONOMOUS MULTI-ASSET BOT    ")
+        print(f"   Equities: {len(NSE_UNIVERSE)} Stocks | FX: {len(CURRENCY_PAIRS)} Pairs | MCX: {len(COMMODITY_SPECS)} Assets")
         print(f"   Mode: {self.mode} | Scan Every: {self.scan_interval}s")
         print(f"   Telegram: {'ACTIVE' if self.notifier.is_enabled else 'NOT CONFIGURED'}")
         print("   Schedule:")
-        print("     09:00-09:15  Currency Pre-Market Scan")
-        print("     09:15-09:30  Gap Opening Detection")
+        print("     09:00-09:15  Currency & Commodity Open")
+        print("     09:15-09:30  Equity Gap Opening Detection")
         print("     09:15-15:15  Equity Intraday Scans")
         print("     09:00-16:45  Currency Trading Window")
         print("     15:25        Equity Auto Square-Off")
         print("     16:45        Currency Auto Square-Off")
+        print("     17:00-23:15  MCX US Session Peak Window")
+        print("     23:15        Commodity Auto Square-Off & EOD Report")
         print("==================================================")
 
         from datetime import time as dt_time
@@ -469,10 +550,7 @@ class TradingDaemon:
 
                 if not is_weekday:
                     # Weekend
-                    if heartbeat_counter % 6 == 1:  # Print every ~60s
-                        days_to_monday = (7 - weekday) % 7
-                        if days_to_monday == 0:
-                            days_to_monday = 7
+                    if heartbeat_counter % 6 == 1:
                         print(f"[{time_str}] Market closed (Weekend - {WEEKDAYS[weekday]}). Next session: Monday 09:00 AM IST. Listening for Telegram commands...")
                     time.sleep(10)
                     continue
@@ -489,10 +567,10 @@ class TradingDaemon:
                     self.daily_report_sent = False
                     self.gap_scanned_today = False
                     self.currency_square_off_done = False
-                    print(f"\n[{time_str}] >> CURRENCY PRE-MARKET WINDOW (09:00-09:15)")
+                    print(f"\n[{time_str}] >> CURRENCY & COMMODITY OPEN (09:00-09:15)")
                     self.run_currency_scan()
-                    next_phase = "Gap Opening Detection at 09:15"
-                    print(f"[{time_str}] Next: {next_phase}. Sleeping {self.scan_interval}s...")
+                    self.run_commodity_scan()
+                    print(f"[{time_str}] Next: Gap Opening at 09:15. Sleeping {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
                 # ─── 9:15 AM – 9:30 AM: Gap Opening + First Equity Scan ──
@@ -503,14 +581,14 @@ class TradingDaemon:
                     print(f"[{time_str}] Next scan in {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
-                # ─── 9:30 AM – 3:15 PM: Regular Equity + Currency Scans ──
+                # ─── 9:30 AM – 3:15 PM: Regular Day Trading Window ───
                 elif dt_time(9, 30) <= now_time <= MARKET_CLOSE:
                     state = self.load_state()
                     open_count = len(state.get("open_positions", []))
-                    print(f"\n[{time_str}] >> INTRADAY SCAN (Equities + Currency) | Open Positions: {open_count}")
+                    print(f"\n[{time_str}] >> INTRADAY SCAN (Equities + FX + MCX) | Open Positions: {open_count}")
                     self.run_scan_cycle()
-                    if CURRENCY_OPEN <= now_time <= CURRENCY_CLOSE:
-                        self.run_currency_scan()
+                    self.run_currency_scan()
+                    self.run_commodity_scan()
                     print(f"[{time_str}] Next scan in {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
@@ -521,47 +599,73 @@ class TradingDaemon:
                     equity_positions = [p for p in state.get("open_positions", []) if p.get("asset_type", "EQUITY") == "EQUITY"]
                     if equity_positions:
                         print(f"[{time_str}] Squaring off {len(equity_positions)} EQUITY position(s)...")
-                        remaining = [p for p in state.get("open_positions", []) if p.get("asset_type") == "CURRENCY"]
+                        remaining = [p for p in state.get("open_positions", []) if p.get("asset_type") != "EQUITY"]
                         for p in equity_positions:
                             self._close_position(state, p, "SQUARE_OFF")
                         state["open_positions"] = remaining
                         self.save_state(state)
                     else:
                         print(f"[{time_str}] No equity positions to square off.")
-                    print(f"[{time_str}] Currency trading continues until 16:45...")
+                    print(f"[{time_str}] Currency (till 16:45) & MCX (till 23:15) continue...")
                     time.sleep(60)
 
-                # ─── 3:25 PM – 4:45 PM: Currency-Only Trading Window ─
+                # ─── 3:25 PM – 4:45 PM: Currency & Commodity Window ──
                 elif SQUARE_OFF < now_time <= CURRENCY_SQUARE_OFF:
                     if not self.currency_square_off_done:
-                        print(f"\n[{time_str}] >> CURRENCY-ONLY WINDOW (15:25-16:45)")
+                        print(f"\n[{time_str}] >> CURRENCY & MCX WINDOW (15:25-16:45)")
                         self.run_currency_scan()
+                        self.run_commodity_scan()
                         state = self.load_state()
                         self.manage_open_positions(state)
-                        print(f"[{time_str}] Next currency scan in {self.scan_interval}s...")
+                        print(f"[{time_str}] Next scan in {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
-                # ─── 4:45 PM – 5:00 PM: Currency Square-Off & Daily Report ──
-                elif CURRENCY_SQUARE_OFF < now_time <= CURRENCY_CLOSE and not self.daily_report_sent:
-                    print(f"\n[{time_str}] >> END OF DAY — FINAL SQUARE-OFF & REPORT")
+                # ─── 4:45 PM – 5:00 PM: Currency Square-Off ──────────
+                elif CURRENCY_SQUARE_OFF < now_time <= CURRENCY_CLOSE:
+                    if not self.currency_square_off_done:
+                        print(f"\n[{time_str}] >> CURRENCY SQUARE-OFF (16:45)")
+                        state = self.load_state()
+                        fx_positions = [p for p in state.get("open_positions", []) if p.get("asset_type") == "CURRENCY"]
+                        if fx_positions:
+                            print(f"[{time_str}] Squaring off {len(fx_positions)} currency position(s)...")
+                            remaining = [p for p in state.get("open_positions", []) if p.get("asset_type") != "CURRENCY"]
+                            for p in fx_positions:
+                                self._close_position(state, p, "SQUARE_OFF")
+                            state["open_positions"] = remaining
+                            self.save_state(state)
+                        self.currency_square_off_done = True
+                        print(f"[{time_str}] Currency session ended. MCX US Evening session starting at 17:00!")
+                    time.sleep(60)
+
+                # ─── 5:00 PM – 11:15 PM: MCX US Evening Peak Window ──
+                elif MCX_US_SESSION_OPEN <= now_time <= MCX_SQUARE_OFF:
+                    print(f"\n[{time_str}] >> MCX US EVENING PEAK SESSION (17:00-23:15)")
+                    self.run_commodity_scan()
+                    state = self.load_state()
+                    self.manage_open_positions(state)
+                    print(f"[{time_str}] Next MCX scan in {self.scan_interval}s...")
+                    time.sleep(self.scan_interval)
+
+                # ─── 11:15 PM – 11:30 PM: Final EOD Square-Off & Report ─
+                elif MCX_SQUARE_OFF < now_time <= MCX_CLOSE and not self.daily_report_sent:
+                    print(f"\n[{time_str}] >> FINAL MASTER SQUARE-OFF & DAILY REPORT (23:15)")
                     state = self.load_state()
                     if state.get("open_positions"):
                         print(f"[{time_str}] Squaring off {len(state['open_positions'])} remaining position(s)...")
                         self.square_off_all(state)
-                    self.currency_square_off_done = True
 
                     summary = self.risk_manager.get_daily_summary()
                     summary["total_pnl"] = state.get("total_pnl", 0.0)
                     self.notifier.notify_daily_summary(summary)
                     self.daily_report_sent = True
-                    print(f"[{time_str}] Daily session concluded. P&L summary sent to Telegram.")
+                    print(f"[{time_str}] Daily session concluded! Full master summary sent to Telegram.")
                     print(f"[{time_str}] Bot will resume tomorrow at 09:00 AM IST.")
                     time.sleep(60)
 
                 else:
-                    # After market close (5:00 PM+)
+                    # After 11:30 PM
                     if heartbeat_counter % 6 == 1:
-                        print(f"[{time_str}] Market closed for today. Next session: Tomorrow 09:00 AM IST. Listening for Telegram commands...")
+                        print(f"[{time_str}] All markets closed for today. Next session: Tomorrow 09:00 AM IST. Listening for Telegram commands...")
                     time.sleep(10)
 
             except KeyboardInterrupt:
@@ -574,11 +678,16 @@ class TradingDaemon:
 
     def _close_position(self, state: dict, p: dict, status: str = "CLOSED"):
         """Closes a single position and records P&L."""
-        exit_price = p["entry_price"]  # Default fallback
+        exit_price = p["entry_price"]
         try:
             today = datetime.now().strftime("%Y-%m-%d")
             from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            if p.get("asset_type") == "CURRENCY":
+            if p.get("asset_type") == "COMMODITY":
+                from trading.commodity_strategy import fetch_commodity_data
+                candles = fetch_commodity_data(p["symbol"], days=7)
+                if candles:
+                    exit_price = candles[-1]["close"]
+            elif p.get("asset_type") == "CURRENCY":
                 from trading.currency_strategy import fetch_currency_data
                 candles = fetch_currency_data(p["symbol"], days=7)
                 if candles:
@@ -601,7 +710,7 @@ class TradingDaemon:
 
         closed = {
             **p,
-            "exit_price": round(exit_price, 4),
+            "exit_price": round(exit_price, 2),
             "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "pnl": round(realized, 2),
             "result": "WIN" if realized > 0 else "LOSS",
