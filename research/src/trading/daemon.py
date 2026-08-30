@@ -129,16 +129,26 @@ class TradingDaemon:
             return "\n".join(lines)
 
         elif cmd == "/currency":
-            sigs = scan_all_currency_pairs()
-            if not sigs:
-                return "No actionable currency setups right now."
-            lines = ["💱 <b>CURRENCY SIGNALS</b>\n━━━━━━━━━━━━━━━━━━━"]
-            for s in sigs:
-                icon = "🟢" if s["direction"] == "BUY" else "🔴"
+            from trading.currency_strategy import get_all_currency_telemetry
+            telemetry = get_all_currency_telemetry()
+            if not telemetry:
+                return "Unable to fetch currency data. Check internet connection."
+
+            lines = ["💱 <b>CURRENCY FUTURES (NSE CDS)</b>\n━━━━━━━━━━━━━━━━━━━"]
+            for s in telemetry:
+                if s["direction"] == "BUY":
+                    badge = f"🟢 <b>BUY ({s['strategy']})</b>"
+                elif s["direction"] == "SELL":
+                    badge = f"🔴 <b>SELL ({s['strategy']})</b>"
+                else:
+                    badge = "⚪ <b>NEUTRAL (Consolidating)</b>"
+
                 lines.append(
-                    f"{icon} <b>{s['symbol']}</b> {s['direction']} | {s['strategy']}\n"
-                    f"  Entry: {s['entry_price']:.4f} | SL: {s['stop_loss']:.4f} | TP: {s['target_price']:.4f}\n"
-                    f"  Lots: {s['lots']} | Risk: INR {s['risk_inr']:.0f} | Conf: {s['confidence']}%"
+                    f"📈 <b>{s['symbol']}</b>: ₹{s['entry_price']:.4f} ({s['trend']})\n"
+                    f"  {badge}\n"
+                    f"  🎯 Target: ₹{s['target_price']:.4f} | 🛑 SL: ₹{s['stop_loss']:.4f}\n"
+                    f"  📦 Lots: {s['lots']} | 🛡️ Risk: ₹{s['risk_inr']:.0f} | 🎯 Conf: {s['confidence']}%\n"
+                    f"  💡 <i>{s['rationale']}</i>\n"
                 )
             return "\n".join(lines)
 

@@ -2,7 +2,12 @@
 Project Atlas — Currency Futures Trading Engine
 Trades USDINR, EURINR, GBPINR, JPYINR on NSE Currency Derivatives (NCD_FO).
 
-Strategy: EMA Ribbon Trend + Bollinger Band Squeeze/Expansion + RSI Confirmation.
+Strategy Stack:
+  1. EMA Ribbon Trend (10/20/50) + Pullback to Support / Resistance
+  2. Bollinger Band (20, 2.0) Squeeze & Breakout
+  3. Mean Reversion at Extremes (RSI Divergence)
+  4. Dynamic ATR Risk Sizing (1:1.5 R:R)
+
 Market Hours: 9:00 AM – 5:00 PM IST (extended hours vs equities).
 Zero STT, Low Margin (~₹1,900/lot for USDINR).
 """
@@ -64,9 +69,9 @@ CURRENCY_SQUARE_OFF = time(16, 45)
 @dataclass
 class CurrencySignal:
     symbol: str
-    direction: str         # "BUY" or "SELL" or "NONE"
+    direction: str         # "BUY", "SELL", or "NONE"
     confidence: int        # 0-100
-    strategy: str          # "TREND_FOLLOW", "BOLLINGER_SQUEEZE", "NONE"
+    strategy: str          # "TREND_FOLLOW", "PULLBACK_DIP", "BOLLINGER_SQUEEZE", "MEAN_REVERSION", "NEUTRAL"
     entry_price: float
     stop_loss: float
     target_price: float
@@ -74,6 +79,10 @@ class CurrencySignal:
     risk_inr: float        # Risk in INR per trade
     rationale: str
     trend: str             # "BULLISH", "BEARISH", "SIDEWAYS"
+    rsi14: float = 50.0
+    ema20: float = 0.0
+    ema50: float = 0.0
+    atr: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -88,6 +97,10 @@ class CurrencySignal:
             "risk_inr": round(self.risk_inr, 2),
             "rationale": self.rationale,
             "trend": self.trend,
+            "rsi14": round(self.rsi14, 1),
+            "ema20": round(self.ema20, 4),
+            "ema50": round(self.ema50, 4),
+            "atr": round(self.atr, 4),
             "signal_type": "CURRENCY",
         }
 
@@ -158,12 +171,6 @@ def generate_currency_signal(
 ) -> CurrencySignal:
     """
     Generates a quantitative trading signal for a currency pair.
-
-    Strategy Stack:
-      1. EMA Ribbon (10/20/50) for trend direction
-      2. Bollinger Band (20, 2.0) squeeze detection for breakout timing
-      3. RSI(14) for momentum confirmation
-      4. ATR for dynamic SL/TP sizing
     """
     spec = CURRENCY_PAIRS.get(pair_symbol)
     if not spec or not candles or len(candles) < 55:
@@ -188,9 +195,9 @@ def generate_currency_signal(
     r14 = rsi14[-1]
 
     if atr <= 0:
-        atr = price * 0.003  # ~0.3% for currency
+        atr = price * 0.003  # ~0.3% default
 
-    # ─── Bollinger Band (20, 2.0) ─────────────────────────────────
+    # ─── Bollinger Bands (20, 2.0) ────────────────────────────────
     bb_period = 20
     recent_closes = closes[-bb_period:]
     bb_mid = sum(recent_closes) / bb_period
@@ -200,7 +207,7 @@ def generate_currency_signal(
     bb_lower = bb_mid - 2.0 * bb_std
     bb_width = (bb_upper - bb_lower) / bb_mid if bb_mid > 0 else 0
 
-    # Squeeze detection: narrow bands indicate breakout coming
+    # Squeeze detection
     prev_closes = closes[-(bb_period + 10):-10]
     if len(prev_closes) >= bb_period:
         prev_mid = sum(prev_closes[-bb_period:]) / bb_period
@@ -211,10 +218,10 @@ def generate_currency_signal(
     else:
         is_squeeze = False
 
-    # ─── Trend Determination (EMA Ribbon) ─────────────────────────
-    if e10 > e20 > e50 and price > e10:
+    # ─── Macro Trend ──────────────────────────────────────────────
+    if e20 > e50:
         trend = "BULLISH"
-    elif e10 < e20 < e50 and price < e10:
+    elif e20 < e50:
         trend = "BEARISH"
     else:
         trend = "SIDEWAYS"
@@ -222,86 +229,94 @@ def generate_currency_signal(
     direction = "NONE"
     confidence = 0
     strategy = "NONE"
-    rationale = "No actionable currency setup"
+    rationale = f"Consolidating at EMA Ribbon ({e20:.4f} / {e50:.4f}), RSI {r14:.0f}"
 
-    # ─── Strategy 1: Trend Following (EMA Ribbon Aligned) ─────────
-    if trend == "BULLISH" and r14 >= 50 and r14 <= 70:
-        # Strong uptrend with room to run (not overbought)
-        direction = "BUY"
-        confidence = 80 if e10 > e20 * 1.001 else 72
-        strategy = "TREND_FOLLOW"
-        rationale = f"EMA Ribbon bullish alignment (10>{20}>{50}), RSI {r14:.0f} — trending with room"
-
-    elif trend == "BEARISH" and r14 <= 50 and r14 >= 30:
-        # Strong downtrend with room to fall (not oversold)
-        direction = "SELL"
-        confidence = 80 if e10 < e20 * 0.999 else 72
-        strategy = "TREND_FOLLOW"
-        rationale = f"EMA Ribbon bearish alignment (10<{20}<{50}), RSI {r14:.0f} — trending down"
-
-    # ─── Strategy 2: Bollinger Squeeze Breakout ───────────────────
-    elif is_squeeze and price > bb_upper:
+    # ─── 1. Trend Momentum Breakout ───────────────────────────────
+    if trend == "BULLISH" and price > e10 > e20 and 52 <= r14 <= 70:
         direction = "BUY"
         confidence = 82
+        strategy = "TREND_MOMENTUM"
+        rationale = f"Bullish momentum expansion (Price > EMA10 > EMA20), RSI {r14:.0f}"
+
+    elif trend == "BEARISH" and price < e10 < e20 and 30 <= r14 <= 48:
+        direction = "SELL"
+        confidence = 82
+        strategy = "TREND_MOMENTUM"
+        rationale = f"Bearish momentum breakdown (Price < EMA10 < EMA20), RSI {r14:.0f}"
+
+    # ─── 2. Trend Pullback / Dip Buying (High Win Rate) ───────────
+    elif trend == "BULLISH" and (price <= e20 or price <= e10) and r14 >= 44:
+        direction = "BUY"
+        confidence = 78
+        strategy = "PULLBACK_DIP"
+        rationale = f"Dip to EMA Support in macro uptrend (Price near EMA20 {e20:.4f}), RSI {r14:.0f}"
+
+    elif trend == "BEARISH" and (price >= e20 or price >= e10) and r14 <= 56:
+        direction = "SELL"
+        confidence = 78
+        strategy = "PULLBACK_RALLY"
+        rationale = f"Rally to EMA Resistance in macro downtrend (Price near EMA20 {e20:.4f}), RSI {r14:.0f}"
+
+    # ─── 3. Bollinger Squeeze Breakout ────────────────────────────
+    elif is_squeeze and price > bb_upper:
+        direction = "BUY"
+        confidence = 80
         strategy = "BOLLINGER_SQUEEZE"
-        rationale = f"Bollinger squeeze breakout above upper band ({bb_upper:.4f}). Expansion expected."
+        rationale = f"Bollinger squeeze breakout above {bb_upper:.4f}. Volatility expansion expected."
 
     elif is_squeeze and price < bb_lower:
         direction = "SELL"
-        confidence = 82
+        confidence = 80
         strategy = "BOLLINGER_SQUEEZE"
-        rationale = f"Bollinger squeeze breakdown below lower band ({bb_lower:.4f}). Expansion expected."
+        rationale = f"Bollinger squeeze breakdown below {bb_lower:.4f}. Volatility expansion expected."
 
-    # ─── Strategy 3: Mean Reversion at Extremes ───────────────────
-    elif r14 <= 25 and price <= bb_lower and trend != "BEARISH":
+    # ─── 4. Mean Reversion at Extremes ────────────────────────────
+    elif r14 <= 30 and price <= bb_lower * 1.002:
         direction = "BUY"
         confidence = 76
         strategy = "MEAN_REVERSION"
-        rationale = f"Extreme oversold (RSI {r14:.0f}) at Bollinger lower band. Snap-back expected."
+        rationale = f"Oversold bounce setup (RSI {r14:.0f}) at Bollinger lower band ({bb_lower:.4f})"
 
-    elif r14 >= 75 and price >= bb_upper and trend != "BULLISH":
+    elif r14 >= 70 and price >= bb_upper * 0.998:
         direction = "SELL"
         confidence = 76
         strategy = "MEAN_REVERSION"
-        rationale = f"Extreme overbought (RSI {r14:.0f}) at Bollinger upper band. Pull-back expected."
+        rationale = f"Overbought reversal setup (RSI {r14:.0f}) at Bollinger upper band ({bb_upper:.4f})"
 
-    if direction == "NONE":
-        return _empty_currency_signal(pair_symbol)
-
-    # ─── Position Sizing & Risk ───────────────────────────────────
+    # ─── Risk Calculation ─────────────────────────────────────────
     sl_distance = atr * 0.75
     tp_distance = sl_distance * 1.5  # 1:1.5 R:R
 
     if direction == "BUY":
         stop_loss = price - sl_distance
         target = price + tp_distance
-    else:
+    elif direction == "SELL":
         stop_loss = price + sl_distance
         target = price - tp_distance
+    else:
+        stop_loss = price - sl_distance
+        target = price + tp_distance
 
-    # Calculate lots based on risk
     risk_amount = capital * (risk_pct / 100.0)
-    pnl_per_lot_per_pip = spec.lot_size * spec.pip_size  # e.g. 1000 * 0.01 = ₹10 / pip
+    pnl_per_lot_per_pip = spec.lot_size * spec.pip_size
     sl_pips = sl_distance / spec.pip_size
-    risk_per_lot = sl_pips * pnl_per_lot_per_pip
+    risk_per_lot = max(sl_pips * pnl_per_lot_per_pip, 1.0)
 
-    lots = max(1, int(risk_amount / max(risk_per_lot, 1)))
-    # Cap lots by margin
-    max_lots_by_margin = int(capital / spec.approx_margin)
-    lots = min(lots, max(1, max_lots_by_margin))
-
+    lots = max(1, int(risk_amount / risk_per_lot))
+    max_lots_by_margin = max(1, int(capital / spec.approx_margin))
+    lots = min(lots, max_lots_by_margin)
     actual_risk = lots * risk_per_lot
 
     return CurrencySignal(
         symbol=pair_symbol, direction=direction, confidence=confidence,
         strategy=strategy, entry_price=price, stop_loss=stop_loss,
         target_price=target, lots=lots, risk_inr=actual_risk,
-        rationale=rationale, trend=trend,
+        rationale=rationale, trend=trend, rsi14=r14, ema20=e20, ema50=e50, atr=atr,
     )
 
 
 def scan_all_currency_pairs(capital: float = 10000.0) -> list[dict]:
-    """Scans all 4 major INR currency pairs for trading signals."""
+    """Scans all 4 major INR currency pairs for actionable trading signals."""
     signals = []
     for pair_symbol in CURRENCY_PAIRS:
         try:
@@ -318,6 +333,20 @@ def scan_all_currency_pairs(capital: float = 10000.0) -> list[dict]:
     return signals
 
 
+def get_all_currency_telemetry(capital: float = 10000.0) -> list[dict]:
+    """Returns complete technical breakdown for all 4 pairs (even when neutral)."""
+    telemetry = []
+    for pair_symbol in CURRENCY_PAIRS:
+        try:
+            candles = fetch_currency_data(pair_symbol, days=90)
+            if candles and len(candles) >= 55:
+                sig = generate_currency_signal(pair_symbol, candles, capital=capital)
+                telemetry.append(sig.to_dict())
+        except Exception as e:
+            continue
+    return telemetry
+
+
 def _empty_currency_signal(pair_symbol: str) -> CurrencySignal:
     return CurrencySignal(
         symbol=pair_symbol, direction="NONE", confidence=0,
@@ -325,18 +354,3 @@ def _empty_currency_signal(pair_symbol: str) -> CurrencySignal:
         target_price=0.0, lots=0, risk_inr=0.0,
         rationale="No actionable setup", trend="UNKNOWN",
     )
-
-
-if __name__ == "__main__":
-    print("=== Currency Futures Scanner ===")
-    for pair in CURRENCY_PAIRS:
-        print(f"\nFetching {pair}...")
-        candles = fetch_currency_data(pair, days=90)
-        print(f"  Got {len(candles)} daily candles")
-        if candles and len(candles) >= 55:
-            sig = generate_currency_signal(pair, candles)
-            print(f"  Direction: {sig.direction} | Confidence: {sig.confidence}%")
-            print(f"  Strategy: {sig.strategy} | Trend: {sig.trend}")
-            print(f"  Entry: {sig.entry_price:.4f} | SL: {sig.stop_loss:.4f} | TP: {sig.target_price:.4f}")
-            print(f"  Lots: {sig.lots} | Risk: INR {sig.risk_inr:.2f}")
-            print(f"  Rationale: {sig.rationale}")
