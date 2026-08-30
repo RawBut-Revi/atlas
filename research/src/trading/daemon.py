@@ -190,32 +190,69 @@ class TradingDaemon:
 
         elif cmd in ("/patterns", "/chart"):
             from trading.patterns import analyze_3hour_patterns
+            from trading.commodity_strategy import fetch_commodity_data, COMMODITY_SPECS
+            from trading.currency_strategy import fetch_currency_data, CURRENCY_PAIRS
             today = datetime.now().strftime("%Y-%m-%d")
             from_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
 
-            lines = ["🕯️ <b>3-HOUR (3H) PATTERN SCANNER</b>\n━━━━━━━━━━━━━━━━━━━"]
-            found_count = 0
-            
-            for sym in list(NSE_UNIVERSE.keys())[:40]:  # Top 40 liquid stocks
+            lines = ["🕯️ <b>MULTI-ASSET 3-HOUR PATTERNS</b>\n━━━━━━━━━━━━━━━━━━━"]
+
+            # 1. MCX Commodities (3H Patterns)
+            lines.append("🛢️ <b>MCX COMMODITIES (3H):</b>")
+            comm_found = 0
+            for sym, spec in COMMODITY_SPECS.items():
+                try:
+                    c_data = fetch_commodity_data(sym, days=60)
+                    if c_data:
+                        res = analyze_3hour_patterns(sym, c_data)
+                        all_p = res.candlestick_patterns + res.chart_patterns
+                        if all_p:
+                            comm_found += 1
+                            icon = "🟢" if res.bias == "BULLISH" else ("🔴" if res.bias == "BEARISH" else "⚪")
+                            lines.append(f"  {icon} <b>{sym}</b> ({spec.name}): <code>{', '.join(all_p)}</code>")
+                except Exception:
+                    continue
+            if comm_found == 0:
+                lines.append("  <i>No active 3H commodity patterns</i>")
+
+            # 2. Currency Derivatives (3H Patterns)
+            lines.append("\n💱 <b>CURRENCY FUTURES (3H):</b>")
+            fx_found = 0
+            for sym in CURRENCY_PAIRS:
+                try:
+                    fx_data = fetch_currency_data(sym, days=60)
+                    if fx_data:
+                        res = analyze_3hour_patterns(sym, fx_data)
+                        all_p = res.candlestick_patterns + res.chart_patterns
+                        if all_p:
+                            fx_found += 1
+                            icon = "🟢" if res.bias == "BULLISH" else ("🔴" if res.bias == "BEARISH" else "⚪")
+                            lines.append(f"  {icon} <b>{sym}</b>: <code>{', '.join(all_p)}</code>")
+                except Exception:
+                    continue
+            if fx_found == 0:
+                lines.append("  <i>No active 3H currency patterns</i>")
+
+            # 3. NSE Equities (3H Patterns)
+            lines.append("\n📊 <b>NSE EQUITIES (3H):</b>")
+            eq_found = 0
+            for sym in list(NSE_UNIVERSE.keys())[:35]:
                 try:
                     df = fetch_historical_data(sym, from_date, today)
                     if df is not None and len(df) >= 30:
                         res = analyze_3hour_patterns(sym, df)
                         all_p = res.candlestick_patterns + res.chart_patterns
                         if all_p and res.bias != "NEUTRAL":
-                            found_count += 1
+                            eq_found += 1
                             icon = "🟢" if res.bias == "BULLISH" else "🔴"
-                            lines.append(
-                                f"{icon} <b>{sym}</b> [{res.bias}] (+{res.confidence_boost}% boost)\n"
-                                f"  Patterns: <code>{', '.join(all_p)}</code>\n"
-                            )
-                            if found_count >= 8:
+                            lines.append(f"  {icon} <b>{sym}</b>: <code>{', '.join(all_p)}</code>")
+                            if eq_found >= 6:
                                 break
                 except Exception:
                     continue
+            if eq_found == 0:
+                lines.append("  <i>No active 3H equity patterns</i>")
 
-            if found_count == 0:
-                lines.append("No active 3-Hour reversal patterns found currently.")
             return "\n".join(lines)
 
         return "Commands: /status, /positions, /pnl, /scan, /gaps, /currency, /commodities, /patterns"

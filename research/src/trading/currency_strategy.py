@@ -23,6 +23,7 @@ from .indicators import (
     calculate_atr_pure,
     calculate_volume_ratio_pure,
 )
+from .patterns import analyze_3hour_patterns
 
 
 # ─── Currency Pair Specifications ────────────────────────────────
@@ -83,6 +84,7 @@ class CurrencySignal:
     ema20: float = 0.0
     ema50: float = 0.0
     atr: float = 0.0
+    pattern_3h: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -101,6 +103,7 @@ class CurrencySignal:
             "ema20": round(self.ema20, 4),
             "ema50": round(self.ema50, 4),
             "atr": round(self.atr, 4),
+            "pattern_3h": self.pattern_3h,
             "signal_type": "CURRENCY",
         }
 
@@ -283,6 +286,30 @@ def generate_currency_signal(
         strategy = "MEAN_REVERSION"
         rationale = f"Overbought reversal setup (RSI {r14:.0f}) at Bollinger upper band ({bb_upper:.4f})"
 
+    # ─── 5. 3-Hour Candlestick & Chart Pattern Analysis ──────────
+    pat_res = analyze_3hour_patterns(pair_symbol, candles)
+    pattern_desc = pat_res.pattern_description if pat_res.candlestick_patterns or pat_res.chart_patterns else ""
+
+    if direction == "BUY" and pat_res.bias == "BULLISH":
+        confidence = min(95, confidence + pat_res.confidence_boost)
+        if pattern_desc:
+            rationale += f" | 3H: {pattern_desc}"
+    elif direction == "SELL" and pat_res.bias == "BEARISH":
+        confidence = min(95, confidence + pat_res.confidence_boost)
+        if pattern_desc:
+            rationale += f" | 3H: {pattern_desc}"
+    elif direction == "NONE" and pat_res.bias != "NEUTRAL":
+        if pat_res.bias == "BULLISH" and r14 >= 42:
+            direction = "BUY"
+            confidence = 78 + pat_res.confidence_boost
+            strategy = "3H_PATTERN_BREAKOUT"
+            rationale = f"3H Pattern setup: {pattern_desc}"
+        elif pat_res.bias == "BEARISH" and r14 <= 58:
+            direction = "SELL"
+            confidence = 78 + pat_res.confidence_boost
+            strategy = "3H_PATTERN_BREAKOUT"
+            rationale = f"3H Pattern setup: {pattern_desc}"
+
     # ─── Risk Calculation ─────────────────────────────────────────
     sl_distance = atr * 0.75
     tp_distance = sl_distance * 1.5  # 1:1.5 R:R
@@ -312,6 +339,7 @@ def generate_currency_signal(
         strategy=strategy, entry_price=price, stop_loss=stop_loss,
         target_price=target, lots=lots, risk_inr=actual_risk,
         rationale=rationale, trend=trend, rsi14=r14, ema20=e20, ema50=e50, atr=atr,
+        pattern_3h=pattern_desc,
     )
 
 

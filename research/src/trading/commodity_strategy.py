@@ -21,6 +21,7 @@ from .indicators import (
     calculate_atr_pure,
     calculate_volume_ratio_pure,
 )
+from .patterns import analyze_3hour_patterns
 
 
 @dataclass
@@ -88,6 +89,7 @@ class CommoditySignal:
     trend: str             # "BULLISH", "BEARISH", "SIDEWAYS"
     rsi14: float = 50.0
     atr: float = 0.0
+    pattern_3h: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -106,6 +108,7 @@ class CommoditySignal:
             "trend": self.trend,
             "rsi14": round(self.rsi14, 1),
             "atr": round(self.atr, 2),
+            "pattern_3h": self.pattern_3h,
             "signal_type": "COMMODITY",
         }
 
@@ -266,6 +269,30 @@ def generate_commodity_signal(
             strategy = "MEAN_REVERSION"
             rationale = f"Overbought reversal setup (RSI {r14:.0f}) at Bollinger upper band (₹{bb_upper:.1f})"
 
+    # ─── 4. 3-Hour Candlestick & Chart Pattern Analysis ──────────
+    pat_res = analyze_3hour_patterns(symbol, candles)
+    pattern_desc = pat_res.pattern_description if pat_res.candlestick_patterns or pat_res.chart_patterns else ""
+
+    if direction == "BUY" and pat_res.bias == "BULLISH":
+        confidence = min(95, confidence + pat_res.confidence_boost)
+        if pattern_desc:
+            rationale += f" | 3H: {pattern_desc}"
+    elif direction == "SELL" and pat_res.bias == "BEARISH":
+        confidence = min(95, confidence + pat_res.confidence_boost)
+        if pattern_desc:
+            rationale += f" | 3H: {pattern_desc}"
+    elif direction == "NONE" and pat_res.bias != "NEUTRAL":
+        if pat_res.bias == "BULLISH" and r14 >= 42:
+            direction = "BUY"
+            confidence = 80 + pat_res.confidence_boost
+            strategy = "3H_PATTERN_BREAKOUT"
+            rationale = f"3H Pattern setup: {pattern_desc}"
+        elif pat_res.bias == "BEARISH" and r14 <= 58:
+            direction = "SELL"
+            confidence = 80 + pat_res.confidence_boost
+            strategy = "3H_PATTERN_BREAKOUT"
+            rationale = f"3H Pattern setup: {pattern_desc}"
+
     # ─── Sizing & Risk ────────────────────────────────────────────
     sl_distance = atr * 0.75
     tp_distance = sl_distance * 1.5
@@ -291,6 +318,7 @@ def generate_commodity_signal(
         target_price=target, lots=lots, risk_inr=actual_risk,
         session=session_tag, rationale=rationale, trend=trend,
         rsi14=r14, atr=atr,
+        pattern_3h=pattern_desc,
     )
 
 
