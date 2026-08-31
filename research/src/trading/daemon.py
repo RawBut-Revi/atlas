@@ -1,13 +1,17 @@
 """
-Project Atlas — Autonomous Quantitative Trading Daemon
-Runs continuously in background (on Android Termux, Laptop, or Cloud).
-Scans 170+ NSE stocks every 3-5 minutes, auto-executes paper trades, manages risk, and sends Telegram alerts.
+Project Atlas — Autonomous Quantitative Multi-Asset Trading Daemon v3
+Architecture:
+  - Thread 1 (Telegram Worker): Dedicated instant <500ms command polling server
+  - Thread 2 (Market Engine): High-speed parallel scanner & position manager
+  - Multi-Asset: NSE Equities + NSE CDS Currency + MCX Commodities
+  - Extended Hours: 09:00 AM – 11:30 PM IST
 """
 
 import os
 import sys
 import time
 import json
+import threading
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pytz
@@ -21,16 +25,29 @@ from trading.risk import RiskManager, MARKET_OPEN, MARKET_CLOSE, SQUARE_OFF
 from trading.telegram_bot import TelegramNotifier
 from trading.gap_strategy import scan_for_gaps
 from trading.currency_strategy import (
-    scan_all_currency_pairs, CURRENCY_PAIRS,
+    scan_all_currency_pairs, get_all_currency_telemetry,
+    fetch_currency_data, CURRENCY_PAIRS,
     CURRENCY_OPEN, CURRENCY_CLOSE, CURRENCY_SQUARE_OFF,
 )
 from trading.commodity_strategy import (
     scan_all_commodities, get_all_commodity_telemetry,
-    COMMODITY_SPECS, MCX_OPEN, MCX_US_SESSION_OPEN, MCX_CLOSE, MCX_SQUARE_OFF,
+    fetch_commodity_data, COMMODITY_SPECS,
+    MCX_OPEN, MCX_US_SESSION_OPEN, MCX_CLOSE, MCX_SQUARE_OFF,
 )
+from trading.patterns import analyze_3hour_patterns
 
 IST = pytz.timezone("Asia/Kolkata")
 JOURNAL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "paper_positions.json")
+
+# Top liquid universe for ultra-fast 5-second intraday scanning
+TOP_INTRADAY_UNIVERSE = [
+    "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", "SBIN", "BHARTIARTL",
+    "ITC", "KOTAKBANK", "LT", "AXISBANK", "TATAMOTORS", "SUNPHARMA", "MARUTI",
+    "TITAN", "BAJFINANCE", "ASIANPAINT", "HCLTECH", "NTPC", "TRENT", "BEL",
+    "JSWSTEEL", "POWERGRID", "M&M", "ADANIENT", "ADANIPORTS", "COALINDIA",
+    "ONGC", "TATASTEEL", "HINDALCO", "TECHM", "WIPRO", "ULTRACEMCO", "HEROMOTOCO",
+    "INDUSINDBK", "GRASIM", "NESTLEIND", "CIPLA", "APOLLOHOSP", "DIVISLAB"
+]
 
 
 class TradingDaemon:
@@ -40,28 +57,63 @@ class TradingDaemon:
         self.risk_manager = RiskManager(capital=10000.0)
         self.notifier = TelegramNotifier()
         self.is_running = True
-        self.last_scan_time = None
+        self.state_lock = threading.Lock()
         self.daily_report_sent = False
         self.gap_scanned_today = False
         self.currency_square_off_done = False
+        self.equity_square_off_done = False
 
     def load_state(self) -> dict:
-        if os.path.exists(JOURNAL_FILE):
-            try:
-                with open(JOURNAL_FILE, "r") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {"open_positions": [], "trade_history": [], "capital": 10000.0, "total_pnl": 0.0}
+        with self.state_lock:
+            if os.path.exists(JOURNAL_FILE):
+                try:
+                    with open(JOURNAL_FILE, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception:
+                    pass
+            return {"open_positions": [], "trade_history": [], "capital": 10000.0, "total_pnl": 0.0}
 
     def save_state(self, state: dict):
-        try:
-            with open(JOURNAL_FILE, "w") as f:
-                json.dump(state, f, indent=2)
-        except Exception as e:
-            print(f"[Daemon] Error saving state: {e}")
+        with self.state_lock:
+            try:
+                with open(JOURNAL_FILE, "w", encoding="utf-8") as f:
+                    json.dump(state, f, indent=2)
+            except Exception as e:
+                print(f"[Daemon] Error saving state: {e}")
 
-    def handle_telegram_command(self, cmd: str) -> str:
+    # ─── 1. Price Retrieval Helper (Supports List & DataFrame) ───
+
+    def get_live_price(self, symbol: str, asset_type: str = "EQUITY", fallback_price: float = 0.0) -> float:
+        """Fetches the latest market price safely across all asset types."""
+        today = datetime.now().strftime("%Y-%m-%d")
+        from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        try:
+            if asset_type == "COMMODITY":
+                candles = fetch_commodity_data(symbol, days=7)
+                if candles and len(candles) > 0:
+                    return float(candles[-1]["close"])
+
+            elif asset_type == "CURRENCY":
+                candles = fetch_currency_data(symbol, days=7)
+                if candles and len(candles) > 0:
+                    return float(candles[-1]["close"])
+
+            else:  # EQUITY
+                df = fetch_historical_data(symbol, from_date, today)
+                if df is not None and len(df) > 0:
+                    if isinstance(df, list):
+                        return float(df[-1]["close"])
+                    elif hasattr(df, "iloc"):
+                        return float(df.iloc[-1]["close"])
+        except Exception:
+            pass
+
+        return fallback_price
+
+    # ─── 2. Telegram Command Handler (Instant Response) ───────────
+
+    def handle_telegram_command(self, cmd: str, sender_id: str = "") -> str:
         """Process incoming commands from mobile Telegram."""
         state = self.load_state()
         cmd = cmd.strip().lower()
@@ -73,23 +125,36 @@ class TradingDaemon:
                 f"━━━━━━━━━━━━━━━━━━━\n"
                 f"⏱️ <b>Time:</b> {now_ist}\n"
                 f"🟢 <b>Status:</b> RUNNING ({self.mode} MODE)\n"
-                f"📊 <b>Equities:</b> {len(NSE_UNIVERSE)} NSE Stocks\n"
+                f"📊 <b>Equities:</b> {len(NSE_UNIVERSE)} Stocks (Top 40 Fast Loop)\n"
                 f"💱 <b>Currency:</b> {len(CURRENCY_PAIRS)} FX Pairs (USD/EUR/GBP/JPY)\n"
-                f"🛢️ <b>Commodities:</b> {len(COMMODITY_SPECS)} MCX Assets (Crude/Gas/Gold/Silver/Copper)\n"
-                f"⚡ <b>Gap Scanner:</b> {'Done' if self.gap_scanned_today else 'Pending (runs at 9:15 AM)'}\n"
-                f"💼 <b>Capital:</b> INR {state.get('capital', 10000):,.2f}\n"
+                f"🛢️ <b>MCX:</b> {len(COMMODITY_SPECS)} Commodities (Crude/Gas/Gold/Silver/Copper)\n"
+                f"⚡ <b>Gap Scanner:</b> {'Done' if self.gap_scanned_today else 'Pending (09:15 AM)'}\n"
+                f"💼 <b>Capital:</b> ₹{state.get('capital', 10000):,.2f}\n"
                 f"⚡ <b>Open Positions:</b> {len(state.get('open_positions', []))}\n"
-                f"💰 <b>Today P&L:</b> INR {state.get('total_pnl', 0.0):.2f}"
+                f"💰 <b>Today Realized P&L:</b> ₹{state.get('total_pnl', 0.0):+.2f}"
             )
 
-        elif cmd == "/positions":
+        elif cmd in ("/positions", "/pos"):
             open_pos = state.get("open_positions", [])
             if not open_pos:
-                return "No open positions currently."
-            
-            lines = ["⚡ <b>ACTIVE POSITIONS</b>\n━━━━━━━━━━━━━━━━━━━"]
+                return "ℹ️ No open positions currently."
+
+            lines = ["⚡ <b>ACTIVE OPEN POSITIONS</b>\n━━━━━━━━━━━━━━━━━━━"]
             for p in open_pos:
                 asset_type = p.get("asset_type", "EQUITY")
+                cur_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
+                
+                # Calculate live unrealized P&L
+                qty = p.get("lots", p.get("qty", 1))
+                if p["direction"] == "BUY":
+                    unrealized_pnl = (cur_price - p["entry_price"]) * qty
+                    unrealized_pct = ((cur_price - p["entry_price"]) / max(p["entry_price"], 0.001)) * 100.0
+                else:
+                    unrealized_pnl = (p["entry_price"] - cur_price) * qty
+                    unrealized_pct = ((p["entry_price"] - cur_price) / max(p["entry_price"], 0.001)) * 100.0
+
+                pnl_badge = f"🟢 +₹{unrealized_pnl:.2f} (+{unrealized_pct:.2f}%)" if unrealized_pnl >= 0 else f"🔴 -₹{abs(unrealized_pnl):.2f} ({unrealized_pct:.2f}%)"
+
                 if asset_type == "COMMODITY":
                     tag = "🛢️"
                     qty_label = f"Lots: {p.get('lots', 1)}"
@@ -102,47 +167,78 @@ class TradingDaemon:
 
                 lines.append(
                     f"{tag} <b>{p['symbol']}</b> ({p['direction']}) | {qty_label}\n"
-                    f"  Entry: {p['entry_price']} | Target: {p['target_price']} | SL: {p['stop_loss']}"
+                    f"  LTP: ₹{cur_price:,.2f} | Entry: ₹{p['entry_price']:,.2f}\n"
+                    f"  🎯 Target: ₹{p['target_price']:,.2f} | 🛑 SL: ₹{p['stop_loss']:,.2f}\n"
+                    f"  P&L: {pnl_badge}\n"
                 )
             return "\n".join(lines)
 
-        elif cmd == "/pnl":
+        elif cmd in ("/pnl", "/summary"):
             history = state.get("trade_history", [])
-            closed_today = [t for t in history if t.get("exit_time", "").startswith(datetime.now().strftime("%Y-%m-%d"))]
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            closed_today = [t for t in history if t.get("exit_time", "").startswith(today_str)]
+            
             wins = len([t for t in closed_today if t.get("pnl", 0) > 0])
-            losses = len([t for t in closed_today if t.get("pnl", 0) <= 0])
+            losses = len([t for t in closed_today if t.get("pnl", 0) < 0])
+            breakevens = len([t for t in closed_today if abs(t.get("pnl", 0)) < 0.01])
             total_trades = len(closed_today)
-            wr = round(wins / max(total_trades, 1) * 100, 1)
+            wr = round(wins / max(total_trades - breakevens, 1) * 100, 1) if (total_trades - breakevens) > 0 else 0.0
             pnl = state.get("total_pnl", 0.0)
 
-            return (
-                f"📈 <b>P&L PERFORMANCE</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━\n"
-                f"🔢 <b>Trades Today:</b> {total_trades}\n"
-                f"✅ Wins: {wins} | ❌ Losses: {losses}\n"
-                f"🎯 Win Rate: {wr}%\n"
-                f"💰 Total Realized P&L: <b>INR {pnl:+.2f}</b>"
-            )
+            lines = [
+                f"📈 <b>TODAY'S P&L SUMMARY ({today_str})</b>",
+                f"━━━━━━━━━━━━━━━━━━━",
+                f"🔢 <b>Total Closed Trades:</b> {total_trades}",
+                f"✅ Wins: {wins} | ❌ Losses: {losses} | ⚪ Breakeven: {breakevens}",
+                f"🎯 <b>Win Rate:</b> {wr}%",
+                f"💰 <b>Total Realized P&L:</b> <b>₹{pnl:+.2f}</b>",
+                f"💼 <b>Current Capital:</b> ₹{state.get('capital', 10000) + pnl:,.2f}\n",
+            ]
+
+            if closed_today:
+                lines.append("📋 <b>TRADE LOG:</b>")
+                for t in closed_today[:10]:
+                    t_pnl = t.get("pnl", 0.0)
+                    t_icon = "🟢" if t_pnl > 0 else ("🔴" if t_pnl < 0 else "⚪")
+                    lines.append(f"{t_icon} <b>{t.get('symbol')}</b> ({t.get('direction')}): ₹{t_pnl:+.2f} | Exit: ₹{t.get('exit_price')} ({t.get('status')})")
+
+            return "\n".join(lines)
+
+        elif cmd in ("/report", "/history"):
+            history = state.get("trade_history", [])
+            if not history:
+                return "ℹ️ No trade history recorded yet."
+
+            lines = ["📜 <b>HISTORICAL TRADE JOURNAL</b>\n━━━━━━━━━━━━━━━━━━━"]
+            for i, t in enumerate(history[:15], 1):
+                t_pnl = t.get("pnl", 0.0)
+                t_icon = "🟢" if t_pnl > 0 else ("🔴" if t_pnl < 0 else "⚪")
+                lines.append(
+                    f"{i}. {t_icon} <b>{t.get('symbol')}</b> ({t.get('direction')}) | P&L: <b>₹{t_pnl:+.2f}</b>\n"
+                    f"   Entry: ₹{t.get('entry_price')} ➔ Exit: ₹{t.get('exit_price')} | {t.get('status')}\n"
+                    f"   Time: {t.get('entry_time', '')} ➔ {t.get('exit_time', '')}\n"
+                )
+            return "\n".join(lines)
 
         elif cmd == "/scan":
-            self.run_scan_cycle()
-            return "🔍 Scan completed! Check signals/positions."
+            threading.Thread(target=self.run_scan_cycle, daemon=True).start()
+            return "🔍 Intraday Scan launched in background! You will receive instant alerts if setups trigger."
 
         elif cmd == "/gaps":
             gaps = scan_for_gaps()
             if not gaps:
-                return "No significant gap openings detected today."
-            lines = ["⚡ <b>GAP OPENINGS DETECTED</b>\n━━━━━━━━━━━━━━━━━━━"]
+                return "ℹ️ No significant gap openings detected today."
+            lines = ["⚡ <b>GAP OPENINGS DETECTED (9:15 AM)</b>\n━━━━━━━━━━━━━━━━━━━"]
             for g in gaps[:8]:
                 icon = "🟢" if g["direction"] == "BUY" else "🔴"
                 lines.append(
                     f"{icon} <b>{g['symbol']}</b> {g['gap_type']} {g['gap_pct']:+.1f}%\n"
-                    f"  {g['strategy']} | {g['direction']} | Conf: {g['confidence']}%"
+                    f"  {g['strategy']} | {g['direction']} | Conf: {g['confidence']}%\n"
+                    f"  Entry: ₹{g['entry_price']} | Target: ₹{g['target_price']} | SL: ₹{g['stop_loss']}\n"
                 )
             return "\n".join(lines)
 
         elif cmd == "/currency":
-            from trading.currency_strategy import get_all_currency_telemetry
             telemetry = get_all_currency_telemetry()
             if not telemetry:
                 return "Unable to fetch currency data. Check internet connection."
@@ -189,15 +285,12 @@ class TradingDaemon:
             return "\n".join(lines)
 
         elif cmd in ("/patterns", "/chart"):
-            from trading.patterns import analyze_3hour_patterns
-            from trading.commodity_strategy import fetch_commodity_data, COMMODITY_SPECS
-            from trading.currency_strategy import fetch_currency_data, CURRENCY_PAIRS
             today = datetime.now().strftime("%Y-%m-%d")
             from_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
 
             lines = ["🕯️ <b>MULTI-ASSET 3-HOUR PATTERNS</b>\n━━━━━━━━━━━━━━━━━━━"]
 
-            # 1. MCX Commodities (3H Patterns)
+            # 1. MCX Commodities
             lines.append("🛢️ <b>MCX COMMODITIES (3H):</b>")
             comm_found = 0
             for sym, spec in COMMODITY_SPECS.items():
@@ -215,7 +308,7 @@ class TradingDaemon:
             if comm_found == 0:
                 lines.append("  <i>No active 3H commodity patterns</i>")
 
-            # 2. Currency Derivatives (3H Patterns)
+            # 2. Currency Derivatives
             lines.append("\n💱 <b>CURRENCY FUTURES (3H):</b>")
             fx_found = 0
             for sym in CURRENCY_PAIRS:
@@ -233,10 +326,10 @@ class TradingDaemon:
             if fx_found == 0:
                 lines.append("  <i>No active 3H currency patterns</i>")
 
-            # 3. NSE Equities (3H Patterns)
+            # 3. NSE Equities
             lines.append("\n📊 <b>NSE EQUITIES (3H):</b>")
             eq_found = 0
-            for sym in list(NSE_UNIVERSE.keys())[:35]:
+            for sym in TOP_INTRADAY_UNIVERSE[:30]:
                 try:
                     df = fetch_historical_data(sym, from_date, today)
                     if df is not None and len(df) >= 30:
@@ -255,10 +348,29 @@ class TradingDaemon:
 
             return "\n".join(lines)
 
-        return "Commands: /status, /positions, /pnl, /scan, /gaps, /currency, /commodities, /patterns"
+        elif cmd == "/help":
+            return (
+                f"🤖 <b>ATLAS BOT COMMANDS</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━\n"
+                f"⚡ /positions — Live open trades & unrealized P&L\n"
+                f"📊 /status — Engine status, capital & market telemetry\n"
+                f"💰 /pnl — Today's closed trades & realized profit\n"
+                f"📜 /report — Full historical trade audit journal\n"
+                f"🕯️ /patterns — 3-Hour Candlestick & Chart Patterns\n"
+                f"🔍 /scan — Trigger fast intraday scan now\n"
+                f"⚡ /gaps — 9:15 AM Gap Openings scanner\n"
+                f"💱 /currency — Live Currency Futures setups\n"
+                f"🛢️ /commodities — Live MCX setups (Crude/Silver/Gold)\n"
+                f"👥 /users — View whitelisted users\n"
+                f"➕ /adduser &lt;id&gt; — Authorize new trading friend"
+            )
+
+        return "Commands: /status, /positions, /pnl, /report, /patterns, /scan, /gaps, /currency, /commodities, /users, /help"
+
+    # ─── 3. High-Speed Intraday Scanning (5-8 Seconds) ────────────
 
     def scan_universe(self) -> list[dict]:
-        """Scans all stocks in universe in parallel and finds high-confidence setups."""
+        """Scans top liquid stocks in parallel with 20 threads (< 8 seconds)."""
         today = datetime.now().strftime("%Y-%m-%d")
         from_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
 
@@ -277,63 +389,53 @@ class TradingDaemon:
                 pass
             return None
 
-        signals = []
-        symbols = get_universe_symbols()
-        with ThreadPoolExecutor(max_workers=16) as executor:
-            future_to_sym = {executor.submit(evaluate_stock, sym): sym for sym in symbols}
+        results = []
+        with ThreadPoolExecutor(max_workers=20) as executor:
+            future_to_sym = {executor.submit(evaluate_stock, sym): sym for sym in TOP_INTRADAY_UNIVERSE}
             for future in as_completed(future_to_sym):
                 res = future.result()
-                if res:
-                    signals.append(res)
+                if res is not None:
+                    results.append(res)
 
-        return signals
+        results.sort(key=lambda s: s["confidence"], reverse=True)
+        return results
+
+    # ─── 4. Position Management & Safe Exits ─────────────────────
 
     def manage_open_positions(self, state: dict):
-        """Monitors open positions against current market prices for SL and TP."""
+        """Checks open positions against Stop Loss and Take Profit levels."""
         open_pos = state.get("open_positions", [])
         if not open_pos:
             return
 
-        today = datetime.now().strftime("%Y-%m-%d")
-        from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
         remaining = []
-
         for p in open_pos:
             try:
-                df = fetch_historical_data(p["symbol"], from_date, today)
-                if df is None or len(df) == 0:
-                    remaining.append(p)
-                    continue
-
-                curr_bar = df.iloc[-1]
-                high = curr_bar["high"]
-                low = curr_bar["low"]
-                close = curr_bar["close"]
-
+                asset_type = p.get("asset_type", "EQUITY")
+                cur_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
+                
                 hit_tp = False
                 hit_sl = False
-                exit_price = close
 
                 if p["direction"] == "BUY":
-                    if high >= p["target_price"]:
+                    if cur_price >= p["target_price"]:
                         hit_tp = True
-                        exit_price = p["target_price"]
-                    elif low <= p["stop_loss"]:
+                    elif cur_price <= p["stop_loss"]:
                         hit_sl = True
-                        exit_price = p["stop_loss"]
                 else:  # SELL
-                    if low <= p["target_price"]:
+                    if cur_price <= p["target_price"]:
                         hit_tp = True
-                        exit_price = p["target_price"]
-                    elif high >= p["stop_loss"]:
+                    elif cur_price >= p["stop_loss"]:
                         hit_sl = True
-                        exit_price = p["stop_loss"]
 
                 if hit_tp or hit_sl:
+                    exit_price = p["target_price"] if hit_tp else p["stop_loss"]
+                    qty = p.get("lots", p.get("qty", 1))
+                    
                     if p["direction"] == "BUY":
-                        realized = (exit_price - p["entry_price"]) * p["qty"]
+                        realized = (exit_price - p["entry_price"]) * qty
                     else:
-                        realized = (p["entry_price"] - exit_price) * p["qty"]
+                        realized = (p["entry_price"] - exit_price) * qty
 
                     closed = {
                         **p,
@@ -341,142 +443,86 @@ class TradingDaemon:
                         "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "pnl": round(realized, 2),
                         "result": "WIN" if realized > 0 else "LOSS",
-                        "status": "CLOSED",
+                        "status": "TAKE_PROFIT" if hit_tp else "STOP_LOSS",
                     }
 
-                    state["trade_history"].insert(0, closed)
+                    state.setdefault("trade_history", []).insert(0, closed)
                     state["total_pnl"] = round(state.get("total_pnl", 0.0) + realized, 2)
                     self.notifier.notify_trade_closed(closed)
-                    print(f"[Daemon] Position Closed: {p['symbol']} P&L: ₹{realized:.2f}")
+                    print(f"[Daemon] Position Closed: {p['symbol']} P&L: ₹{realized:.2f} ({closed['status']})")
                 else:
                     remaining.append(p)
 
             except Exception as e:
+                print(f"[Daemon] Error managing position {p.get('symbol')}: {e}")
                 remaining.append(p)
 
         state["open_positions"] = remaining
         self.save_state(state)
 
+    def _close_position(self, state: dict, p: dict, status: str = "CLOSED"):
+        """Closes a single position cleanly with real market price."""
+        asset_type = p.get("asset_type", "EQUITY")
+        exit_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
+
+        qty = p.get("lots", p.get("qty", 1))
+        if p["direction"] == "BUY":
+            realized = (exit_price - p["entry_price"]) * qty
+        else:
+            realized = (p["entry_price"] - exit_price) * qty
+
+        closed = {
+            **p,
+            "exit_price": round(exit_price, 2),
+            "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "pnl": round(realized, 2),
+            "result": "WIN" if realized > 0 else ("LOSS" if realized < 0 else "BREAKEVEN"),
+            "status": status,
+        }
+        state.setdefault("trade_history", []).insert(0, closed)
+        state["total_pnl"] = round(state.get("total_pnl", 0.0) + realized, 2)
+        self.notifier.notify_trade_closed(closed)
+
     def square_off_all(self, state: dict):
-        """Force-closes all remaining open positions at 3:15 PM IST."""
+        """Force-closes all remaining open positions."""
         open_pos = state.get("open_positions", [])
         if not open_pos:
             return
 
-        print("[Daemon] 3:15 PM IST: Squaring off all open intraday positions...")
-        today = datetime.now().strftime("%Y-%m-%d")
-        from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-
+        print(f"[Daemon] Squaring off {len(open_pos)} open positions...")
         for p in open_pos:
-            exit_price = p["entry_price"]
-            try:
-                df = fetch_historical_data(p["symbol"], from_date, today)
-                if df is not None and len(df) > 0:
-                    exit_price = df.iloc[-1]["close"]
-            except Exception:
-                pass
-
-            if p["direction"] == "BUY":
-                realized = (exit_price - p["entry_price"]) * p["qty"]
-            else:
-                realized = (p["entry_price"] - exit_price) * p["qty"]
-
-            closed = {
-                **p,
-                "exit_price": round(exit_price, 2),
-                "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "pnl": round(realized, 2),
-                "result": "WIN" if realized > 0 else "LOSS",
-                "status": "SQUARE_OFF",
-            }
-            state["trade_history"].insert(0, closed)
-            state["total_pnl"] = round(state.get("total_pnl", 0.0) + realized, 2)
-            self.notifier.notify_trade_closed(closed)
+            self._close_position(state, p, "SQUARE_OFF")
 
         state["open_positions"] = []
         self.save_state(state)
 
-    def run_scan_cycle(self):
-        """Runs one full scan and execution cycle."""
-        state = self.load_state()
-        print(f"\n[Daemon] [{datetime.now().strftime('%H:%M:%S')}] Scanning universe ({len(NSE_UNIVERSE)} stocks)...")
-
-        # 1. Manage existing positions first
-        self.manage_open_positions(state)
-
-        # 2. Check risk limits
-        can_trade, reason = self.risk_manager.can_trade()
-        if not can_trade:
-            print(f"[Daemon] Trade entry paused: {reason}")
-            return
-
-        # 3. Check max simultaneous positions
-        if len(state.get("open_positions", [])) >= 3:
-            print("[Daemon] Max simultaneous positions (3) reached. Monitoring existing.")
-            return
-
-        # 4. Scan for new setups
-        signals = self.scan_universe()
-        print(f"[Daemon] Found {len(signals)} high-confidence setups.")
-
-        # 5. Take top 1-2 setups
-        for sig in signals[:2]:
-            # Don't duplicate open symbols
-            if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
-                continue
-
-            self.notifier.notify_signal_found(sig)
-
-            # Auto-execute paper trade
-            pos_id = f"pos_{int(time.time()*1000)}"
-            new_pos = {
-                "id": pos_id,
-                "symbol": sig["symbol"],
-                "direction": sig["direction"],
-                "qty": sig.get("suggested_qty", 10),
-                "entry_price": sig["entry_price"],
-                "stop_loss": sig["stop_loss"],
-                "target_price": sig["target_price"],
-                "mode": self.mode,
-                "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "status": "OPEN",
-            }
-
-            state.setdefault("open_positions", []).append(new_pos)
-            self.save_state(state)
-            self.notifier.notify_trade_executed(new_pos)
-            print(f"[Daemon] Executed {self.mode} {sig['direction']} {new_pos['qty']}x {sig['symbol']} @ ₹{sig['entry_price']}")
-
-            if len(state.get("open_positions", [])) >= 3:
-                break
+    # ─── 5. Scanning Loops ────────────────────────────────────────
 
     def run_gap_scan(self):
-        """Runs gap opening scan at 9:15 AM — once per day."""
+        """Runs 9:15 AM Gap opening detection across all 181 stocks."""
         if self.gap_scanned_today:
             return
 
-        print(f"\n[Daemon] [{datetime.now().strftime('%H:%M:%S')}] Running Early Market GAP Scanner...")
+        print(f"\n[Daemon] [{datetime.now().strftime('%H:%M:%S')}] Running Early Market GAP Scanner (181 Stocks)...")
         state = self.load_state()
 
         gap_signals = scan_for_gaps()
         if gap_signals:
             print(f"[Daemon] Found {len(gap_signals)} gap openings!")
-            for g in gap_signals[:3]:  # Take top 3 gaps
+            for g in gap_signals[:2]:
                 if any(p["symbol"] == g["symbol"] for p in state.get("open_positions", [])):
                     continue
-                if len(state.get("open_positions", [])) >= 5:
+                if len(state.get("open_positions", [])) >= 4:
                     break
 
-                # Notify on Telegram
                 self.notifier.notify_signal_found(g)
 
-                # Auto-execute paper trade
                 pos_id = f"gap_{int(time.time()*1000)}"
                 new_pos = {
                     "id": pos_id,
                     "symbol": g["symbol"],
                     "direction": g["direction"],
-                    "qty": 10,  # Default qty for gaps
+                    "qty": 10,
                     "entry_price": g["entry_price"],
                     "stop_loss": g["stop_loss"],
                     "target_price": g["target_price"],
@@ -495,21 +541,67 @@ class TradingDaemon:
 
         self.gap_scanned_today = True
 
-    def run_currency_scan(self):
-        """Scans currency futures for trading setups."""
+    def run_scan_cycle(self):
+        """Runs fast 5-8 second intraday equity scan."""
         state = self.load_state()
-        print(f"\n[Daemon] [{datetime.now().strftime('%H:%M:%S')}] Scanning Currency Futures (4 FX pairs)...")
+        print(f"\n[Daemon] [{datetime.now().strftime('%H:%M:%S')}] Fast Intraday Scan ({len(TOP_INTRADAY_UNIVERSE)} stocks)...")
 
-        # Check max positions
+        # 1. Manage open positions
+        self.manage_open_positions(state)
+
+        # 2. Risk check
+        can_trade, reason = self.risk_manager.can_trade()
+        if not can_trade:
+            print(f"[Daemon] Trade entry paused: {reason}")
+            return
+
+        equity_pos = [p for p in state.get("open_positions", []) if p.get("asset_type", "EQUITY") == "EQUITY"]
+        if len(equity_pos) >= 2:
+            print("[Daemon] Max equity positions (2) reached. Monitoring.")
+            return
+
+        # 3. Fast scan
+        signals = self.scan_universe()
+        if signals:
+            print(f"[Daemon] Found {len(signals)} high-confidence setups!")
+            for sig in signals[:1]:
+                if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
+                    continue
+
+                self.notifier.notify_signal_found(sig)
+
+                pos_id = f"eq_{int(time.time()*1000)}"
+                new_pos = {
+                    "id": pos_id,
+                    "symbol": sig["symbol"],
+                    "direction": sig["direction"],
+                    "qty": sig.get("suggested_qty", 10),
+                    "entry_price": sig["entry_price"],
+                    "stop_loss": sig["stop_loss"],
+                    "target_price": sig["target_price"],
+                    "mode": self.mode,
+                    "asset_type": "EQUITY",
+                    "strategy": sig.get("strategy", "INTRADAY"),
+                    "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "status": "OPEN",
+                }
+                state.setdefault("open_positions", []).append(new_pos)
+                self.save_state(state)
+                self.notifier.notify_trade_executed(new_pos)
+                print(f"[Daemon] Executed {self.mode} {sig['direction']} {new_pos['qty']}x {sig['symbol']} @ ₹{sig['entry_price']}")
+        else:
+            print("[Daemon] No actionable equity setups currently.")
+
+    def run_currency_scan(self):
+        """Scans 4 FX currency pairs."""
+        state = self.load_state()
         currency_positions = [p for p in state.get("open_positions", []) if p.get("asset_type") == "CURRENCY"]
         if len(currency_positions) >= 2:
-            print("[Daemon] Max currency positions (2) reached. Monitoring.")
             return
 
         currency_signals = scan_all_currency_pairs()
         if currency_signals:
-            print(f"[Daemon] Found {len(currency_signals)} currency setups!")
-            for sig in currency_signals[:1]:  # Take top 1 currency signal
+            for sig in currency_signals[:1]:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
                     continue
 
@@ -535,22 +627,16 @@ class TradingDaemon:
                 self.save_state(state)
                 self.notifier.notify_trade_executed(new_pos)
                 print(f"[Daemon] CURRENCY: {sig['direction']} {sig['lots']} lot(s) {sig['symbol']} @ {sig['entry_price']:.4f}")
-        else:
-            print("[Daemon] No actionable currency setups.")
 
     def run_commodity_scan(self):
-        """Scans MCX commodity futures for trading setups."""
+        """Scans MCX commodity futures."""
         state = self.load_state()
-        print(f"\n[Daemon] [{datetime.now().strftime('%H:%M:%S')}] Scanning MCX Commodities ({len(COMMODITY_SPECS)} assets)...")
-
         commodity_positions = [p for p in state.get("open_positions", []) if p.get("asset_type") == "COMMODITY"]
         if len(commodity_positions) >= 2:
-            print("[Daemon] Max commodity positions (2) reached. Monitoring.")
             return
 
         commodity_signals = scan_all_commodities()
         if commodity_signals:
-            print(f"[Daemon] Found {len(commodity_signals)} commodity setups!")
             for sig in commodity_signals[:1]:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
                     continue
@@ -578,36 +664,27 @@ class TradingDaemon:
                 self.save_state(state)
                 self.notifier.notify_trade_executed(new_pos)
                 print(f"[Daemon] MCX: {sig['direction']} {sig['lots']} lot(s) {sig['symbol']} @ ₹{sig['entry_price']:,.1f}")
-        else:
-            print("[Daemon] No actionable commodity setups.")
 
-    def run(self):
-        """Main daemon loop — Multi-Asset Schedule: 9:00 AM to 11:30 PM IST."""
-        print("==================================================")
-        print("   PROJECT ATLAS — AUTONOMOUS MULTI-ASSET BOT    ")
-        print(f"   Equities: {len(NSE_UNIVERSE)} Stocks | FX: {len(CURRENCY_PAIRS)} Pairs | MCX: {len(COMMODITY_SPECS)} Assets")
-        print(f"   Mode: {self.mode} | Scan Every: {self.scan_interval}s")
-        print(f"   Telegram: {'ACTIVE' if self.notifier.is_enabled else 'NOT CONFIGURED'}")
-        print("   Schedule:")
-        print("     09:00-09:15  Currency & Commodity Open")
-        print("     09:15-09:30  Equity Gap Opening Detection")
-        print("     09:15-15:15  Equity Intraday Scans")
-        print("     09:00-16:45  Currency Trading Window")
-        print("     15:25        Equity Auto Square-Off")
-        print("     16:45        Currency Auto Square-Off")
-        print("     17:00-23:15  MCX US Session Peak Window")
-        print("     23:15        Commodity Auto Square-Off & EOD Report")
-        print("==================================================")
+    # ─── 6. Dedicated Concurrent Threads ─────────────────────────
 
+    def telegram_polling_thread(self):
+        """Dedicated thread running 24/7 for instant <500ms Telegram responses."""
+        print("[Telegram Poller] Dedicated command server started (Sub-second response active).")
+        while self.is_running:
+            try:
+                self.notifier.check_incoming_commands(self.handle_telegram_command)
+                time.sleep(0.8)
+            except Exception as e:
+                time.sleep(1.0)
+
+    def market_scheduler_thread(self):
+        """Dedicated thread for market scanning and execution."""
         from datetime import time as dt_time
         WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         heartbeat_counter = 0
 
         while self.is_running:
             try:
-                # Always poll Telegram commands
-                self.notifier.check_incoming_commands(self.handle_telegram_command)
-
                 now_ist = datetime.now(IST)
                 now_time = now_ist.time()
                 weekday = now_ist.weekday()
@@ -616,176 +693,141 @@ class TradingDaemon:
                 heartbeat_counter += 1
 
                 if not is_weekday:
-                    # Weekend
                     if heartbeat_counter % 6 == 1:
-                        print(f"[{time_str}] Market closed (Weekend - {WEEKDAYS[weekday]}). Next session: Monday 09:00 AM IST. Listening for Telegram commands...")
+                        print(f"[{time_str}] Market closed (Weekend - {WEEKDAYS[weekday]}). Telegram command server ACTIVE.")
                     time.sleep(10)
                     continue
 
-                # ─── Before Market: 00:00 – 9:00 AM ──────────────────
+                # 00:00 – 09:00: Before market
                 if now_time < CURRENCY_OPEN:
                     if heartbeat_counter % 6 == 1:
-                        print(f"[{time_str}] Waiting for market open at 09:00 AM IST. Listening for Telegram commands...")
+                        print(f"[{time_str}] Pre-market standby. Markets open at 09:00 AM IST.")
                     time.sleep(10)
                     continue
 
-                # ─── 9:00 AM – 9:15 AM: Currency Pre-Market Scan ─────
+                # 09:00 – 09:15: Currency & Commodity open
                 elif CURRENCY_OPEN <= now_time < MARKET_OPEN:
                     self.daily_report_sent = False
                     self.gap_scanned_today = False
                     self.currency_square_off_done = False
+                    self.equity_square_off_done = False
                     print(f"\n[{time_str}] >> CURRENCY & COMMODITY OPEN (09:00-09:15)")
                     self.run_currency_scan()
                     self.run_commodity_scan()
-                    print(f"[{time_str}] Next: Gap Opening at 09:15. Sleeping {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
-                # ─── 9:15 AM – 9:30 AM: Gap Opening + First Equity Scan ──
+                # 09:15 – 09:30: Gap Opening Scan + First Equity Scan
                 elif MARKET_OPEN <= now_time < dt_time(9, 30):
-                    print(f"\n[{time_str}] >> GAP OPENING + EQUITY SCAN WINDOW (09:15-09:30)")
+                    print(f"\n[{time_str}] >> GAP OPENING + FAST EQUITY SCAN (09:15-09:30)")
                     self.run_gap_scan()
                     self.run_scan_cycle()
-                    print(f"[{time_str}] Next scan in {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
-                # ─── 9:30 AM – 3:15 PM: Regular Day Trading Window ───
+                # 09:30 – 15:15: Regular Intraday Scans
                 elif dt_time(9, 30) <= now_time <= MARKET_CLOSE:
                     state = self.load_state()
                     open_count = len(state.get("open_positions", []))
-                    print(f"\n[{time_str}] >> INTRADAY SCAN (Equities + FX + MCX) | Open Positions: {open_count}")
+                    print(f"\n[{time_str}] >> INTRADAY SCAN (Equities + FX + MCX) | Open: {open_count}")
                     self.run_scan_cycle()
                     self.run_currency_scan()
                     self.run_commodity_scan()
-                    print(f"[{time_str}] Next scan in {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
-                # ─── 3:15 PM – 3:25 PM: Equity Square-Off Window ─────
+                # 15:15 – 15:25: Equity Square-off
                 elif MARKET_CLOSE < now_time <= SQUARE_OFF:
-                    print(f"\n[{time_str}] >> EQUITY SQUARE-OFF WINDOW (15:15-15:25)")
-                    state = self.load_state()
-                    equity_positions = [p for p in state.get("open_positions", []) if p.get("asset_type", "EQUITY") == "EQUITY"]
-                    if equity_positions:
-                        print(f"[{time_str}] Squaring off {len(equity_positions)} EQUITY position(s)...")
-                        remaining = [p for p in state.get("open_positions", []) if p.get("asset_type") != "EQUITY"]
+                    if not self.equity_square_off_done:
+                        print(f"\n[{time_str}] >> 15:15 PM: SQUARING OFF ALL EQUITY POSITIONS")
+                        state = self.load_state()
+                        equity_positions = [p for p in state.get("open_positions", []) if p.get("asset_type", "EQUITY") == "EQUITY"]
+                        remaining = [p for p in state.get("open_positions", []) if p.get("asset_type", "EQUITY") != "EQUITY"]
+                        
                         for p in equity_positions:
                             self._close_position(state, p, "SQUARE_OFF")
+                        
                         state["open_positions"] = remaining
                         self.save_state(state)
-                    else:
-                        print(f"[{time_str}] No equity positions to square off.")
-                    print(f"[{time_str}] Currency (till 16:45) & MCX (till 23:15) continue...")
-                    time.sleep(60)
+                        self.equity_square_off_done = True
+                        print(f"[{time_str}] Equity square-off complete. Currency & MCX continue.")
+                    time.sleep(30)
 
-                # ─── 3:25 PM – 4:45 PM: Currency & Commodity Window ──
+                # 15:25 – 16:45: Currency & Commodity Window
                 elif SQUARE_OFF < now_time <= CURRENCY_SQUARE_OFF:
-                    if not self.currency_square_off_done:
-                        print(f"\n[{time_str}] >> CURRENCY & MCX WINDOW (15:25-16:45)")
-                        self.run_currency_scan()
-                        self.run_commodity_scan()
-                        state = self.load_state()
-                        self.manage_open_positions(state)
-                        print(f"[{time_str}] Next scan in {self.scan_interval}s...")
-                    time.sleep(self.scan_interval)
-
-                # ─── 4:45 PM – 5:00 PM: Currency Square-Off ──────────
-                elif CURRENCY_SQUARE_OFF < now_time <= CURRENCY_CLOSE:
-                    if not self.currency_square_off_done:
-                        print(f"\n[{time_str}] >> CURRENCY SQUARE-OFF (16:45)")
-                        state = self.load_state()
-                        fx_positions = [p for p in state.get("open_positions", []) if p.get("asset_type") == "CURRENCY"]
-                        if fx_positions:
-                            print(f"[{time_str}] Squaring off {len(fx_positions)} currency position(s)...")
-                            remaining = [p for p in state.get("open_positions", []) if p.get("asset_type") != "CURRENCY"]
-                            for p in fx_positions:
-                                self._close_position(state, p, "SQUARE_OFF")
-                            state["open_positions"] = remaining
-                            self.save_state(state)
-                        self.currency_square_off_done = True
-                        print(f"[{time_str}] Currency session ended. MCX US Evening session starting at 17:00!")
-                    time.sleep(60)
-
-                # ─── 5:00 PM – 11:15 PM: MCX US Evening Peak Window ──
-                elif MCX_US_SESSION_OPEN <= now_time <= MCX_SQUARE_OFF:
-                    print(f"\n[{time_str}] >> MCX US EVENING PEAK SESSION (17:00-23:15)")
+                    self.run_currency_scan()
                     self.run_commodity_scan()
                     state = self.load_state()
                     self.manage_open_positions(state)
-                    print(f"[{time_str}] Next MCX scan in {self.scan_interval}s...")
                     time.sleep(self.scan_interval)
 
-                # ─── 11:15 PM – 11:30 PM: Final EOD Square-Off & Report ─
-                elif MCX_SQUARE_OFF < now_time <= MCX_CLOSE and not self.daily_report_sent:
-                    print(f"\n[{time_str}] >> FINAL MASTER SQUARE-OFF & DAILY REPORT (23:15)")
+                # 16:45 – 17:00: Currency Square-off
+                elif CURRENCY_SQUARE_OFF < now_time <= CURRENCY_CLOSE:
+                    if not self.currency_square_off_done:
+                        print(f"\n[{time_str}] >> 16:45 PM: SQUARING OFF CURRENCY POSITIONS")
+                        state = self.load_state()
+                        fx_positions = [p for p in state.get("open_positions", []) if p.get("asset_type") == "CURRENCY"]
+                        remaining = [p for p in state.get("open_positions", []) if p.get("asset_type") != "CURRENCY"]
+                        
+                        for p in fx_positions:
+                            self._close_position(state, p, "SQUARE_OFF")
+                        
+                        state["open_positions"] = remaining
+                        self.save_state(state)
+                        self.currency_square_off_done = True
+                        print(f"[{time_str}] Currency square-off complete. MCX US Evening peak starts at 17:00.")
+                    time.sleep(30)
+
+                # 17:00 – 23:15: MCX US Evening Peak Window
+                elif MCX_US_SESSION_OPEN <= now_time <= MCX_SQUARE_OFF:
+                    self.run_commodity_scan()
                     state = self.load_state()
-                    if state.get("open_positions"):
-                        print(f"[{time_str}] Squaring off {len(state['open_positions'])} remaining position(s)...")
-                        self.square_off_all(state)
+                    self.manage_open_positions(state)
+                    time.sleep(self.scan_interval)
+
+                # 23:15 – 23:30: MCX Square-off & EOD Master Summary
+                elif MCX_SQUARE_OFF < now_time <= MCX_CLOSE and not self.daily_report_sent:
+                    print(f"\n[{time_str}] >> 23:15 PM: FINAL MASTER SQUARE-OFF & DAILY REPORT")
+                    state = self.load_state()
+                    self.square_off_all(state)
 
                     summary = self.risk_manager.get_daily_summary()
                     summary["total_pnl"] = state.get("total_pnl", 0.0)
                     self.notifier.notify_daily_summary(summary)
                     self.daily_report_sent = True
                     print(f"[{time_str}] Daily session concluded! Full master summary sent to Telegram.")
-                    print(f"[{time_str}] Bot will resume tomorrow at 09:00 AM IST.")
                     time.sleep(60)
 
                 else:
-                    # After 11:30 PM
                     if heartbeat_counter % 6 == 1:
-                        print(f"[{time_str}] All markets closed for today. Next session: Tomorrow 09:00 AM IST. Listening for Telegram commands...")
+                        print(f"[{time_str}] Off-market hours. Next session tomorrow 09:00 AM IST. Telegram server ACTIVE.")
                     time.sleep(10)
 
-            except KeyboardInterrupt:
-                print("\n[Daemon] Stopping trading daemon...")
-                self.is_running = False
-                break
             except Exception as e:
-                print(f"[Daemon] Loop exception: {e}")
+                print(f"[Market Engine] Loop exception: {e}")
                 time.sleep(10)
 
-    def _close_position(self, state: dict, p: dict, status: str = "CLOSED"):
-        """Closes a single position and records P&L."""
-        exit_price = p["entry_price"]
+    def run(self):
+        """Entry point: starts both concurrent threads."""
+        print("==================================================")
+        print("   PROJECT ATLAS — AUTONOMOUS MULTI-ASSET BOT v3  ")
+        print(f"   Equities: 181 Stocks (Top 40 Fast) | FX: 4 Pairs | MCX: 5 Assets")
+        print(f"   Mode: {self.mode} | Dual-Threaded Concurrency: ACTIVE")
+        print(f"   Telegram Users: {len(self.notifier.chat_ids)} Authorized")
+        print("==================================================")
+
+        # Start Thread 1: Telegram Server Thread
+        t_telegram = threading.Thread(target=self.telegram_polling_thread, name="TelegramServer", daemon=True)
+        t_telegram.start()
+
+        # Start Thread 2: Market Scheduler Thread
+        t_scanner = threading.Thread(target=self.market_scheduler_thread, name="MarketScanner", daemon=True)
+        t_scanner.start()
+
+        # Keep main thread alive
         try:
-            today = datetime.now().strftime("%Y-%m-%d")
-            from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-            if p.get("asset_type") == "COMMODITY":
-                from trading.commodity_strategy import fetch_commodity_data
-                candles = fetch_commodity_data(p["symbol"], days=7)
-                if candles:
-                    exit_price = candles[-1]["close"]
-            elif p.get("asset_type") == "CURRENCY":
-                from trading.currency_strategy import fetch_currency_data
-                candles = fetch_currency_data(p["symbol"], days=7)
-                if candles:
-                    exit_price = candles[-1]["close"]
-            else:
-                df = fetch_historical_data(p["symbol"], from_date, today)
-                if df is not None and len(df) > 0:
-                    if isinstance(df, list):
-                        exit_price = df[-1]["close"]
-                    else:
-                        exit_price = df.iloc[-1]["close"]
-        except Exception:
-            pass
-
-        qty = p.get("lots", p.get("qty", 1))
-        if p["direction"] == "BUY":
-            realized = (exit_price - p["entry_price"]) * qty
-        else:
-            realized = (p["entry_price"] - exit_price) * qty
-
-        closed = {
-            **p,
-            "exit_price": round(exit_price, 2),
-            "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "pnl": round(realized, 2),
-            "result": "WIN" if realized > 0 else "LOSS",
-            "status": status,
-        }
-        state.setdefault("trade_history", []).insert(0, closed)
-        state["total_pnl"] = round(state.get("total_pnl", 0.0) + realized, 2)
-        self.notifier.notify_trade_closed(closed)
+            while self.is_running:
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            print("\n[Daemon] Stopping Atlas trading bot...")
+            self.is_running = False
 
 
 if __name__ == "__main__":

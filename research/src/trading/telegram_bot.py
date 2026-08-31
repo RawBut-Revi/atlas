@@ -1,13 +1,17 @@
 """
 Project Atlas — Multi-User Telegram Bot Notifier & Command Center
 Allows multiple authorized users to monitor, receive alerts, and control the trading bot.
+Persists whitelist to disk so authorized friends are never lost on restart.
 """
 
 import os
+import json
 import requests
 import time
 from datetime import datetime
 from typing import Callable, Optional, List
+
+USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "authorized_users.json")
 
 
 def _load_env_file():
@@ -44,21 +48,65 @@ class TelegramNotifier:
     def __init__(self, token: str = None, chat_id: str = None):
         _load_env_file()
         self.token = token or os.environ.get("TELEGRAM_BOT_TOKEN", "")
-        raw_chat_ids = chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
-        
-        # Parse comma-separated or space-separated list of Chat IDs
-        self.chat_ids: list[str] = [
-            cid.strip() for cid in raw_chat_ids.replace(",", " ").split() if cid.strip()
-        ]
+        self.chat_ids: list[str] = self._load_authorized_users(chat_id)
         self.last_update_id = 0
         self.is_enabled = bool(self.token and len(self.chat_ids) > 0)
 
+    def _load_authorized_users(self, override_chat_id: Optional[str] = None) -> list[str]:
+        """Loads whitelist from JSON file and .env."""
+        users = set()
+        
+        # 1. From authorized_users.json
+        if os.path.exists(USERS_FILE):
+            try:
+                with open(USERS_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for u in data:
+                            if str(u).strip():
+                                users.add(str(u).strip())
+            except Exception:
+                pass
+
+        # 2. From .env / override
+        raw_env = override_chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
+        for cid in raw_env.replace(",", " ").split():
+            if cid.strip():
+                users.add(cid.strip())
+
+        # Always include default authorized users
+        users.add("2095090861")
+        users.add("1321498518")
+
+        user_list = sorted(list(users))
+        self._save_authorized_users(user_list)
+        return user_list
+
+    def _save_authorized_users(self, user_list: list[str]):
+        """Persists whitelist to disk."""
+        try:
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(user_list, f, indent=2)
+        except Exception:
+            pass
+
     def add_authorized_user(self, new_chat_id: str) -> bool:
-        """Dynamically whitelists a new user chat ID."""
+        """Dynamically whitelists a new user and saves to disk permanently."""
         new_chat_id = str(new_chat_id).strip()
         if new_chat_id and new_chat_id not in self.chat_ids:
             self.chat_ids.append(new_chat_id)
-            # Update environment variable
+            self._save_authorized_users(self.chat_ids)
+            os.environ["TELEGRAM_CHAT_ID"] = ",".join(self.chat_ids)
+            self.is_enabled = True
+            return True
+        return False
+
+    def remove_authorized_user(self, chat_id: str) -> bool:
+        """Removes a user from whitelist."""
+        chat_id = str(chat_id).strip()
+        if chat_id in self.chat_ids:
+            self.chat_ids.remove(chat_id)
+            self._save_authorized_users(self.chat_ids)
             os.environ["TELEGRAM_CHAT_ID"] = ",".join(self.chat_ids)
             return True
         return False
@@ -89,7 +137,7 @@ class TelegramNotifier:
                 "disable_web_page_preview": True,
             }
             try:
-                resp = requests.post(url, json=payload, timeout=8)
+                resp = requests.post(url, json=payload, timeout=6)
                 if resp.status_code != 200:
                     success = False
             except Exception as e:
@@ -123,7 +171,7 @@ class TelegramNotifier:
         """Broadcast trade execution alert to all authorized users."""
         mode_tag = f"[{trade.get('mode', 'PAPER')}]"
         action = "🟢 BOUGHT" if trade.get("direction") == "BUY" else "🔴 SOLD"
-        qty_str = f"{trade.get('lots')} lot(s)" if trade.get("asset_type") in ("CURRENCY", "COMMODITY") else f"{trade.get('qty')}x"
+        qty_str = f"{trade.get('lots', trade.get('qty', 1))} lot(s)" if trade.get("asset_type") in ("CURRENCY", "COMMODITY") else f"{trade.get('qty', 10)}x"
 
         msg = (
             f"⚡ <b>TRADE EXECUTED {mode_tag}</b>\n"
@@ -137,15 +185,24 @@ class TelegramNotifier:
     def notify_trade_closed(self, trade: dict):
         """Broadcast trade exit & P&L alert to all authorized users."""
         pnl = trade.get("pnl", 0.0)
-        is_win = pnl >= 0
-        icon = "🎉 <b>WINNER TAKE-PROFIT</b>" if is_win else "🛑 <b>STOP-LOSS HIT</b>"
-        pnl_str = f"+₹{pnl:.2f}" if is_win else f"-₹{abs(pnl):.2f}"
+        is_win = pnl > 0
+        is_scratch = abs(pnl) < 0.01
+        
+        if is_scratch:
+            icon = "⚪ <b>POSITION SQUARED-OFF</b>"
+            pnl_str = "₹0.00 (Breakeven)"
+        elif is_win:
+            icon = "🎉 <b>WINNER TAKE-PROFIT</b>"
+            pnl_str = f"+₹{pnl:.2f}"
+        else:
+            icon = "🛑 <b>STOP-LOSS HIT</b>"
+            pnl_str = f"-₹{abs(pnl):.2f}"
         
         msg = (
             f"{icon}\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>{trade.get('symbol')}</b> ({trade.get('direction')})\n"
-            f"💵 <b>Exit Price:</b> ₹{trade.get('exit_price')} (Entry: ₹{trade.get('entry_price')})\n"
+            f"💵 <b>Exit:</b> ₹{trade.get('exit_price')} (Entry: ₹{trade.get('entry_price')})\n"
             f"💰 <b>Realized P&L:</b> <code>{pnl_str}</code>\n"
             f"⏰ Exit Time: {trade.get('exit_time')}"
         )
@@ -164,12 +221,12 @@ class TelegramNotifier:
             f"🔢 <b>Total Trades:</b> {summary.get('total_trades', 0)}\n"
             f"✅ <b>Wins:</b> {summary.get('wins', 0)} | ❌ <b>Losses:</b> {summary.get('losses', 0)}\n"
             f"🎯 <b>Win Rate:</b> {summary.get('win_rate', 0)}%\n"
-            f"{pnl_emoji} <b>Net P&L:</b> <code>{pnl_str}</code>\n"
+            f"{pnl_emoji} <b>Net Realized P&L:</b> <code>{pnl_str}</code>\n"
             f"💼 <b>Closing Capital:</b> ₹{summary.get('capital', 10000) + pnl:,.2f}"
         )
         self.send_message(msg)
 
-    def check_incoming_commands(self, command_handler: Callable[[str], str]):
+    def check_incoming_commands(self, command_handler: Callable[[str, str], str]):
         """
         Polls for commands from any user.
         - If the sender is authorized, runs the command and replies directly to them.
@@ -204,25 +261,34 @@ class TelegramNotifier:
                         if sender_id in self.chat_ids:
                             self.add_authorized_user(new_id)
                             self.send_message(
-                                f"✅ User <code>{new_id}</code> has been authorized!\nThey can now monitor and chat with the bot.",
+                                f"✅ User <code>{new_id}</code> permanently authorized!\nWhitelist saved to disk.",
                                 target_chat_id=sender_id,
                             )
                             self.send_message(
-                                "🎉 <b>Welcome to Project Atlas Trading Bot!</b>\nYou are now authorized to monitor and chat with the bot.\nSend /status or /patterns to get started.",
+                                "🎉 <b>Welcome to Project Atlas Trading Bot!</b>\nYou are now authorized to monitor and chat with the bot.\nSend /status or /positions to get started.",
                                 target_chat_id=new_id,
                             )
                         else:
                             self.send_message("❌ Only authorized admins can add new users.", target_chat_id=sender_id)
                     continue
 
+                # Admin command: /users
+                if text == "/users":
+                    if sender_id in self.chat_ids:
+                        lines = ["👥 <b>AUTHORIZED USERS WHITELIST</b>\n━━━━━━━━━━━━━━━━━━━"]
+                        for i, uid in enumerate(self.chat_ids, 1):
+                            lines.append(f"{i}. <code>{uid}</code>")
+                        self.send_message("\n".join(lines), target_chat_id=sender_id)
+                    continue
+
                 # Authorized User Check
                 if sender_id in self.chat_ids:
-                    reply = command_handler(text)
+                    reply = command_handler(text, sender_id)
                     if reply:
                         self.send_message(reply, target_chat_id=sender_id)
                 else:
                     # Unauthorized user helper
-                    sender_name = msg.get("from", {}).get("first_name", "Friend")
+                    sender_name = msg.get("from", {}).get("first_name", "Trader")
                     help_msg = (
                         f"🔒 <b>Access Restricted</b>\n\n"
                         f"Hello {sender_name}!\n"
@@ -233,5 +299,5 @@ class TelegramNotifier:
                     )
                     self.send_message(help_msg, target_chat_id=sender_id)
 
-        except Exception as e:
+        except Exception:
             pass
