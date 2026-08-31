@@ -35,6 +35,7 @@ from trading.commodity_strategy import (
     MCX_OPEN, MCX_US_SESSION_OPEN, MCX_CLOSE, MCX_SQUARE_OFF,
 )
 from trading.patterns import analyze_3hour_patterns
+from trading.charges import calculate_trade_charges
 
 IST = pytz.timezone("Asia/Kolkata")
 JOURNAL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "paper_positions.json")
@@ -178,29 +179,38 @@ class TradingDaemon:
             today_str = datetime.now().strftime("%Y-%m-%d")
             closed_today = [t for t in history if t.get("exit_time", "").startswith(today_str)]
             
-            wins = len([t for t in closed_today if t.get("pnl", 0) > 0])
-            losses = len([t for t in closed_today if t.get("pnl", 0) < 0])
-            breakevens = len([t for t in closed_today if abs(t.get("pnl", 0)) < 0.01])
+            gross_pnl = sum(t.get("gross_pnl", t.get("pnl", 0.0)) for t in closed_today)
+            total_fees = sum(t.get("charges", 0.0) for t in closed_today)
+            net_pnl = sum(t.get("net_pnl", t.get("pnl", 0.0)) for t in closed_today)
+
+            wins = len([t for t in closed_today if t.get("net_pnl", t.get("pnl", 0)) > 0])
+            losses = len([t for t in closed_today if t.get("net_pnl", t.get("pnl", 0)) < 0])
+            breakevens = len([t for t in closed_today if abs(t.get("net_pnl", t.get("pnl", 0))) < 0.01])
             total_trades = len(closed_today)
             wr = round(wins / max(total_trades - breakevens, 1) * 100, 1) if (total_trades - breakevens) > 0 else 0.0
-            pnl = state.get("total_pnl", 0.0)
 
             lines = [
-                f"📈 <b>TODAY'S P&L SUMMARY ({today_str})</b>",
+                f"📈 <b>TODAY'S REAL-WORLD P&L ({today_str})</b>",
                 f"━━━━━━━━━━━━━━━━━━━",
-                f"🔢 <b>Total Closed Trades:</b> {total_trades}",
+                f"🔢 <b>Total Trades:</b> {total_trades}",
                 f"✅ Wins: {wins} | ❌ Losses: {losses} | ⚪ Breakeven: {breakevens}",
-                f"🎯 <b>Win Rate:</b> {wr}%",
-                f"💰 <b>Total Realized P&L:</b> <b>₹{pnl:+.2f}</b>",
-                f"💼 <b>Current Capital:</b> ₹{state.get('capital', 10000) + pnl:,.2f}\n",
+                f"🎯 <b>Win Rate:</b> {wr}%\n",
+                f"💰 <b>Gross Trading P&L:</b> <code>₹{gross_pnl:+.2f}</code>",
+                f"🧾 <b>Brokerage & Taxes:</b> <code>-₹{total_fees:.2f}</code>",
+                f"💵 <b>Net Take-Home P&L:</b> <b>₹{net_pnl:+.2f}</b>",
+                f"💼 <b>Closing Capital:</b> ₹{state.get('capital', 10000) + net_pnl:,.2f}\n",
             ]
 
             if closed_today:
-                lines.append("📋 <b>TRADE LOG:</b>")
-                for t in closed_today[:10]:
-                    t_pnl = t.get("pnl", 0.0)
-                    t_icon = "🟢" if t_pnl > 0 else ("🔴" if t_pnl < 0 else "⚪")
-                    lines.append(f"{t_icon} <b>{t.get('symbol')}</b> ({t.get('direction')}): ₹{t_pnl:+.2f} | Exit: ₹{t.get('exit_price')} ({t.get('status')})")
+                lines.append("📋 <b>TRADE FEE BREAKDOWN:</b>")
+                for t in closed_today[:8]:
+                    t_net = t.get("net_pnl", t.get("pnl", 0.0))
+                    t_gross = t.get("gross_pnl", t_net)
+                    t_fee = t.get("charges", 0.0)
+                    t_icon = "🟢" if t_net > 0 else ("🔴" if t_net < 0 else "⚪")
+                    lines.append(
+                        f"{t_icon} <b>{t.get('symbol')}</b> ({t.get('direction')}): Gross ₹{t_gross:+.2f} | Fees -₹{t_fee:.2f} ➔ Net <b>₹{t_net:+.2f}</b>"
+                    )
 
             return "\n".join(lines)
 
@@ -209,13 +219,16 @@ class TradingDaemon:
             if not history:
                 return "ℹ️ No trade history recorded yet."
 
-            lines = ["📜 <b>HISTORICAL TRADE JOURNAL</b>\n━━━━━━━━━━━━━━━━━━━"]
-            for i, t in enumerate(history[:15], 1):
-                t_pnl = t.get("pnl", 0.0)
-                t_icon = "🟢" if t_pnl > 0 else ("🔴" if t_pnl < 0 else "⚪")
+            lines = ["📜 <b>HISTORICAL TRADE JOURNAL (REAL-WORLD)</b>\n━━━━━━━━━━━━━━━━━━━"]
+            for i, t in enumerate(history[:12], 1):
+                t_net = t.get("net_pnl", t.get("pnl", 0.0))
+                t_gross = t.get("gross_pnl", t_net)
+                t_fee = t.get("charges", 0.0)
+                t_icon = "🟢" if t_net > 0 else ("🔴" if t_net < 0 else "⚪")
                 lines.append(
-                    f"{i}. {t_icon} <b>{t.get('symbol')}</b> ({t.get('direction')}) | P&L: <b>₹{t_pnl:+.2f}</b>\n"
-                    f"   Entry: ₹{t.get('entry_price')} ➔ Exit: ₹{t.get('exit_price')} | {t.get('status')}\n"
+                    f"{i}. {t_icon} <b>{t.get('symbol')}</b> ({t.get('direction')}) | Net P&L: <b>₹{t_net:+.2f}</b>\n"
+                    f"   Gross: ₹{t_gross:+.2f} | Taxes/Fees: -₹{t_fee:.2f} | {t.get('status')}\n"
+                    f"   Entry: ₹{t.get('entry_price')} ➔ Exit: ₹{t.get('exit_price')}\n"
                     f"   Time: {t.get('entry_time', '')} ➔ {t.get('exit_time', '')}\n"
                 )
             return "\n".join(lines)
@@ -432,24 +445,28 @@ class TradingDaemon:
                     exit_price = p["target_price"] if hit_tp else p["stop_loss"]
                     qty = p.get("lots", p.get("qty", 1))
                     
-                    if p["direction"] == "BUY":
-                        realized = (exit_price - p["entry_price"]) * qty
-                    else:
-                        realized = (p["entry_price"] - exit_price) * qty
+                    chg = calculate_trade_charges(
+                        p["symbol"], asset_type, p["direction"],
+                        p["entry_price"], exit_price, qty_or_lots=qty
+                    )
 
                     closed = {
                         **p,
                         "exit_price": round(exit_price, 2),
                         "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "pnl": round(realized, 2),
-                        "result": "WIN" if realized > 0 else "LOSS",
+                        "gross_pnl": round(chg.gross_pnl, 2),
+                        "charges": round(chg.total_charges, 2),
+                        "net_pnl": round(chg.net_pnl, 2),
+                        "pnl": round(chg.net_pnl, 2),  # Default pnl is Net Take-Home
+                        "charges_breakdown": chg.to_dict(),
+                        "result": "WIN" if chg.net_pnl > 0 else "LOSS",
                         "status": "TAKE_PROFIT" if hit_tp else "STOP_LOSS",
                     }
 
                     state.setdefault("trade_history", []).insert(0, closed)
-                    state["total_pnl"] = round(state.get("total_pnl", 0.0) + realized, 2)
+                    state["total_pnl"] = round(state.get("total_pnl", 0.0) + chg.net_pnl, 2)
                     self.notifier.notify_trade_closed(closed)
-                    print(f"[Daemon] Position Closed: {p['symbol']} P&L: ₹{realized:.2f} ({closed['status']})")
+                    print(f"[Daemon] Position Closed: {p['symbol']} Gross: ₹{chg.gross_pnl:.2f} | Fees: ₹{chg.total_charges:.2f} | Net: ₹{chg.net_pnl:.2f} ({closed['status']})")
                 else:
                     remaining.append(p)
 
@@ -461,26 +478,30 @@ class TradingDaemon:
         self.save_state(state)
 
     def _close_position(self, state: dict, p: dict, status: str = "CLOSED"):
-        """Closes a single position cleanly with real market price."""
+        """Closes a single position cleanly with real market price and statutory charges."""
         asset_type = p.get("asset_type", "EQUITY")
         exit_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
-
         qty = p.get("lots", p.get("qty", 1))
-        if p["direction"] == "BUY":
-            realized = (exit_price - p["entry_price"]) * qty
-        else:
-            realized = (p["entry_price"] - exit_price) * qty
+
+        chg = calculate_trade_charges(
+            p["symbol"], asset_type, p["direction"],
+            p["entry_price"], exit_price, qty_or_lots=qty
+        )
 
         closed = {
             **p,
             "exit_price": round(exit_price, 2),
             "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "pnl": round(realized, 2),
-            "result": "WIN" if realized > 0 else ("LOSS" if realized < 0 else "BREAKEVEN"),
+            "gross_pnl": round(chg.gross_pnl, 2),
+            "charges": round(chg.total_charges, 2),
+            "net_pnl": round(chg.net_pnl, 2),
+            "pnl": round(chg.net_pnl, 2),  # Default pnl is Net Take-Home
+            "charges_breakdown": chg.to_dict(),
+            "result": "WIN" if chg.net_pnl > 0 else ("LOSS" if chg.net_pnl < 0 else "BREAKEVEN"),
             "status": status,
         }
         state.setdefault("trade_history", []).insert(0, closed)
-        state["total_pnl"] = round(state.get("total_pnl", 0.0) + realized, 2)
+        state["total_pnl"] = round(state.get("total_pnl", 0.0) + chg.net_pnl, 2)
         self.notifier.notify_trade_closed(closed)
 
     def square_off_all(self, state: dict):

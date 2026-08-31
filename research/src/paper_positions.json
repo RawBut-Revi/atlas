@@ -50,7 +50,23 @@
       "status": "SQUARE_OFF",
       "exit_price": 95.15,
       "exit_time": "2026-08-31 16:45:39",
-      "pnl": 0.29,
+      "gross_pnl": 290.0,
+      "charges": 49.54,
+      "net_pnl": 240.46,
+      "pnl": 240.46,
+      "charges_breakdown": {
+        "gross_pnl": 290.0,
+        "net_pnl": 240.46,
+        "total_charges": 49.54,
+        "brokerage": 40.0,
+        "stt": 0.0,
+        "exchange_charges": 1.72,
+        "gst": 7.54,
+        "sebi_charges": 0.19,
+        "stamp_duty": 0.1,
+        "total_turnover": 190590.0,
+        "breakeven_points": 0.0495
+      },
       "result": "WIN"
     },
     {
@@ -68,8 +84,24 @@
       "status": "SQUARE_OFF",
       "exit_price": 1920.0,
       "exit_time": "2026-08-31 15:15:00",
-      "pnl": 0.0,
-      "result": "BREAKEVEN"
+      "gross_pnl": 0.0,
+      "charges": 26.68,
+      "net_pnl": -26.68,
+      "pnl": -26.68,
+      "charges_breakdown": {
+        "gross_pnl": 0.0,
+        "net_pnl": -26.68,
+        "total_charges": 26.68,
+        "brokerage": 17.28,
+        "stt": 4.32,
+        "exchange_charges": 1.19,
+        "gst": 3.33,
+        "sebi_charges": 0.03,
+        "stamp_duty": 0.52,
+        "total_turnover": 34560.0,
+        "breakeven_points": 2.9641
+      },
+      "result": "LOSS"
     },
     {
       "id": "pos_1788151714727",
@@ -86,10 +118,29 @@
       "status": "SQUARE_OFF",
       "exit_price": 1047.5,
       "exit_time": "2026-08-31 15:15:00",
-      "pnl": 0.0,
-      "result": "BREAKEVEN"
+      "gross_pnl": 0.0,
+      "charges": 29.11,
+      "net_pnl": -29.11,
+      "pnl": -29.11,
+      "charges_breakdown": {
+        "gross_pnl": 0.0,
+        "net_pnl": -29.11,
+        "total_charges": 29.11,
+        "brokerage": 18.86,
+        "stt": 4.71,
+        "exchange_charges": 1.3,
+        "gst": 3.63,
+        "sebi_charges": 0.04,
+        "stamp_duty": 0.57,
+        "total_turnover": 37710.0,
+        "breakeven_points": 1.6171
+      },
+      "result": "LOSS"
     }
   ],
   "capital": 10000.0,
-  "total_pnl": 0.29
+  "total_pnl": 184.67,
+  "total_gross_pnl": 290.0,
+  "total_charges_paid": 105.33,
+  "total_net_pnl": 184.67
 }

@@ -183,46 +183,59 @@ class TelegramNotifier:
         self.send_message(msg)
 
     def notify_trade_closed(self, trade: dict):
-        """Broadcast trade exit & P&L alert to all authorized users."""
-        pnl = trade.get("pnl", 0.0)
-        is_win = pnl > 0
-        is_scratch = abs(pnl) < 0.01
+        """Broadcast trade exit & P&L alert with real-world tax breakdown."""
+        gross_pnl = trade.get("gross_pnl", trade.get("pnl", 0.0))
+        charges = trade.get("charges", 0.0)
+        net_pnl = trade.get("net_pnl", gross_pnl - charges)
         
-        if is_scratch:
-            icon = "⚪ <b>POSITION SQUARED-OFF</b>"
-            pnl_str = "₹0.00 (Breakeven)"
-        elif is_win:
+        is_win = net_pnl > 0
+        is_scratch = abs(gross_pnl) < 0.01 and charges == 0.0
+
+        if is_win:
             icon = "🎉 <b>WINNER TAKE-PROFIT</b>"
-            pnl_str = f"+₹{pnl:.2f}"
+        elif is_scratch:
+            icon = "⚪ <b>POSITION SQUARED-OFF</b>"
         else:
-            icon = "🛑 <b>STOP-LOSS HIT</b>"
-            pnl_str = f"-₹{abs(pnl):.2f}"
-        
+            icon = "🛑 <b>TRADE CLOSED</b>" if gross_pnl >= 0 else "🛑 <b>STOP-LOSS HIT</b>"
+
+        gross_str = f"+₹{gross_pnl:.2f}" if gross_pnl >= 0 else f"-₹{abs(gross_pnl):.2f}"
+        net_str = f"+₹{net_pnl:.2f}" if net_pnl >= 0 else f"-₹{abs(net_pnl):.2f}"
+
+        charges_line = f"🧾 <b>Taxes & Fees:</b> -₹{charges:.2f}\n" if charges > 0 else ""
+
         msg = (
             f"{icon}\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"📊 <b>{trade.get('symbol')}</b> ({trade.get('direction')})\n"
             f"💵 <b>Exit:</b> ₹{trade.get('exit_price')} (Entry: ₹{trade.get('entry_price')})\n"
-            f"💰 <b>Realized P&L:</b> <code>{pnl_str}</code>\n"
+            f"💰 <b>Gross Profit:</b> <code>{gross_str}</code>\n"
+            f"{charges_line}"
+            f"💵 <b>Net Take-Home:</b> <code>{net_str}</code>\n"
             f"⏰ Exit Time: {trade.get('exit_time')}"
         )
         self.send_message(msg)
 
     def notify_daily_summary(self, summary: dict):
-        """Broadcast end of day summary report to all authorized users."""
-        pnl = summary.get("total_pnl", 0.0)
-        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-        pnl_str = f"+₹{pnl:.2f}" if pnl >= 0 else f"-₹{abs(pnl):.2f}"
+        """Broadcast end of day summary report with gross & net P&L."""
+        net_pnl = summary.get("total_net_pnl", summary.get("total_pnl", 0.0))
+        gross_pnl = summary.get("total_gross_pnl", net_pnl)
+        total_charges = summary.get("total_charges_paid", 0.0)
+
+        pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
+        net_str = f"+₹{net_pnl:.2f}" if net_pnl >= 0 else f"-₹{abs(net_pnl):.2f}"
+        gross_str = f"+₹{gross_pnl:.2f}" if gross_pnl >= 0 else f"-₹{abs(gross_pnl):.2f}"
 
         msg = (
-            f"📊 <b>DAILY MULTI-ASSET SUMMARY</b>\n"
+            f"📊 <b>DAILY REAL-WORLD P&L REPORT</b>\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
             f"📅 <b>Date:</b> {datetime.now().strftime('%d %b %Y')}\n"
             f"🔢 <b>Total Trades:</b> {summary.get('total_trades', 0)}\n"
             f"✅ <b>Wins:</b> {summary.get('wins', 0)} | ❌ <b>Losses:</b> {summary.get('losses', 0)}\n"
             f"🎯 <b>Win Rate:</b> {summary.get('win_rate', 0)}%\n"
-            f"{pnl_emoji} <b>Net Realized P&L:</b> <code>{pnl_str}</code>\n"
-            f"💼 <b>Closing Capital:</b> ₹{summary.get('capital', 10000) + pnl:,.2f}"
+            f"💰 <b>Gross P&L:</b> <code>{gross_str}</code>\n"
+            f"🧾 <b>Brokerage & Taxes:</b> <code>-₹{total_charges:.2f}</code>\n"
+            f"{pnl_emoji} <b>Net Realized P&L:</b> <code>{net_str}</code>\n"
+            f"💼 <b>Closing Capital:</b> ₹{summary.get('capital', 10000) + net_pnl:,.2f}"
         )
         self.send_message(msg)
 
