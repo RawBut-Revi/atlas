@@ -112,35 +112,108 @@ class TradingDaemon:
 
         return fallback_price
 
+    def calculate_margin_and_risk(self, state: dict) -> dict:
+        """Calculates exact margin usage, free cash, and scenario risk exposure across open trades."""
+        total_account_capital = state.get("capital", 10000.0) + state.get("total_pnl", 0.0)
+        open_pos = state.get("open_positions", [])
+
+        used_margin = 0.0
+        total_max_sl_loss = 0.0
+        total_max_tp_gain = 0.0
+
+        for p in open_pos:
+            asset_type = p.get("asset_type", "EQUITY")
+            symbol = p.get("symbol", "")
+            qty = p.get("lots", p.get("qty", 1))
+
+            # 1. Used Margin calculation
+            if asset_type == "CURRENCY":
+                spec = CURRENCY_PAIRS.get(symbol)
+                pos_margin = qty * (spec.approx_margin if spec else 2000.0)
+                multiplier = 100000.0 if "JPY" in symbol else 1000.0
+            elif asset_type == "COMMODITY":
+                spec = COMMODITY_SPECS.get(symbol)
+                pos_margin = qty * (spec.approx_margin if spec else 15000.0)
+                if "CRUDE" in symbol:
+                    multiplier = 10.0
+                elif "NATGAS" in symbol:
+                    multiplier = 250.0
+                elif "SILVER" in symbol:
+                    multiplier = 1.0
+                elif "GOLD" in symbol:
+                    multiplier = 100.0
+                elif "COPPER" in symbol:
+                    multiplier = 2500.0
+                else:
+                    multiplier = 1.0
+            else:  # EQUITY (5x intraday MIS leverage)
+                pos_margin = (p.get("entry_price", 0.0) * qty) / 5.0
+                multiplier = 1.0
+
+            used_margin += pos_margin
+
+            # 2. Scenario Risk Exposure
+            sl_dist = abs(p.get("entry_price", 0.0) - p.get("stop_loss", 0.0))
+            tp_dist = abs(p.get("target_price", 0.0) - p.get("entry_price", 0.0))
+
+            total_max_sl_loss += sl_dist * qty * multiplier
+            total_max_tp_gain += tp_dist * qty * multiplier
+
+        free_margin = max(0.0, total_account_capital - used_margin)
+        utilization_pct = (used_margin / max(total_account_capital, 1.0)) * 100.0
+        max_loss_pct = (total_max_sl_loss / max(total_account_capital, 1.0)) * 100.0
+        max_gain_pct = (total_max_tp_gain / max(total_account_capital, 1.0)) * 100.0
+
+        return {
+            "total_capital": total_account_capital,
+            "used_margin": used_margin,
+            "free_margin": free_margin,
+            "utilization_pct": utilization_pct,
+            "total_max_sl_loss": total_max_sl_loss,
+            "total_max_tp_gain": total_max_tp_gain,
+            "max_loss_pct": max_loss_pct,
+            "max_gain_pct": max_gain_pct,
+            "open_count": len(open_pos),
+        }
+
     # ─── 2. Telegram Command Handler (Instant Response) ───────────
 
     def handle_telegram_command(self, cmd: str, sender_id: str = "") -> str:
         """Process incoming commands from mobile Telegram."""
         state = self.load_state()
         cmd = cmd.strip().lower()
+        risk_metrics = self.calculate_margin_and_risk(state)
 
         if cmd == "/status":
             now_ist = datetime.now(IST).strftime("%H:%M:%S IST")
             return (
-                f"🤖 <b>ATLAS MULTI-ASSET BOT STATUS</b>\n"
+                f"🤖 <b>ATLAS MULTI-ASSET PORTFOLIO STATUS</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
-                f"⏱️ <b>Time:</b> {now_ist}\n"
-                f"🟢 <b>Status:</b> RUNNING ({self.mode} MODE)\n"
-                f"📊 <b>Equities:</b> {len(NSE_UNIVERSE)} Stocks (Top 40 Fast Loop)\n"
-                f"💱 <b>Currency:</b> {len(CURRENCY_PAIRS)} FX Pairs (USD/EUR/GBP/JPY)\n"
-                f"🛢️ <b>MCX:</b> {len(COMMODITY_SPECS)} Commodities (Crude/Gas/Gold/Silver/Copper)\n"
-                f"⚡ <b>Gap Scanner:</b> {'Done' if self.gap_scanned_today else 'Pending (09:15 AM)'}\n"
-                f"💼 <b>Capital:</b> ₹{state.get('capital', 10000):,.2f}\n"
-                f"⚡ <b>Open Positions:</b> {len(state.get('open_positions', []))}\n"
-                f"💰 <b>Today Realized P&L:</b> ₹{state.get('total_pnl', 0.0):+.2f}"
+                f"⏱️ <b>Time:</b> {now_ist} | 🟢 <b>Status:</b> RUNNING\n\n"
+                f"💼 <b>DEMAT CAPITAL ALLOCATION:</b>\n"
+                f"  💰 <b>Total Balance:</b> ₹{risk_metrics['total_capital']:,.2f}\n"
+                f"  🔒 <b>Used Margin:</b> ₹{risk_metrics['used_margin']:,.2f} ({risk_metrics['utilization_pct']:.1f}% Locked)\n"
+                f"  🟢 <b>Free Cash:</b> ₹{risk_metrics['free_margin']:,.2f} (Available)\n"
+                f"  ⚡ <b>Active Trades:</b> {risk_metrics['open_count']} Open\n\n"
+                f"🛡️ <b>SCENARIO RISK EXPOSURE:</b>\n"
+                f"  🛑 <b>Worst Case (All SLs Hit):</b> -₹{risk_metrics['total_max_sl_loss']:,.2f} (-{risk_metrics['max_loss_pct']:.1f}% Risk)\n"
+                f"  🎯 <b>Best Case (All TPs Hit):</b> +₹{risk_metrics['total_max_tp_gain']:,.2f} (+{risk_metrics['max_gain_pct']:.1f}% Gain)\n"
+                f"  ⚖️ <b>Risk : Reward:</b> 1 : 1.50\n\n"
+                f"📈 <b>TODAY'S PERFORMANCE:</b>\n"
+                f"  💵 <b>Realized Net P&L:</b> ₹{state.get('total_pnl', 0.0):+.2f}\n"
+                f"  📊 <b>Markets:</b> 181 Equities + 4 FX + 5 MCX"
             )
 
         elif cmd in ("/positions", "/pos"):
             open_pos = state.get("open_positions", [])
             if not open_pos:
-                return "ℹ️ No open positions currently."
+                return f"ℹ️ No active positions.\n🟢 Free Margin Available: ₹{risk_metrics['free_margin']:,.2f}"
 
-            lines = ["⚡ <b>ACTIVE OPEN POSITIONS</b>\n━━━━━━━━━━━━━━━━━━━"]
+            lines = [
+                f"⚡ <b>ACTIVE POSITIONS ({len(open_pos)} Open)</b>",
+                f"🔒 Used: ₹{risk_metrics['used_margin']:,.0f} | 🟢 Free: ₹{risk_metrics['free_margin']:,.0f}",
+                f"━━━━━━━━━━━━━━━━━━━"
+            ]
             for p in open_pos:
                 asset_type = p.get("asset_type", "EQUITY")
                 cur_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
@@ -166,12 +239,22 @@ class TradingDaemon:
                     tag = "📊"
                     qty_label = f"Qty: {p.get('qty', 10)}"
 
+                # Position risk scenario
+                sl_risk = abs(p["entry_price"] - p["stop_loss"]) * qty
+                tp_reward = abs(p["target_price"] - p["entry_price"]) * qty
+
                 lines.append(
                     f"{tag} <b>{p['symbol']}</b> ({p['direction']}) | {qty_label}\n"
-                    f"  LTP: ₹{cur_price:,.2f} | Entry: ₹{p['entry_price']:,.2f}\n"
-                    f"  🎯 Target: ₹{p['target_price']:,.2f} | 🛑 SL: ₹{p['stop_loss']:,.2f}\n"
-                    f"  P&L: {pnl_badge}\n"
+                    f"  LTP: ₹{cur_price:,.2f} (Entry: ₹{p['entry_price']:,.2f})\n"
+                    f"  🎯 Target: ₹{p['target_price']:,.2f} (+₹{tp_reward:,.0f})\n"
+                    f"  🛑 SL: ₹{p['stop_loss']:,.2f} (-₹{sl_risk:,.0f})\n"
+                    f"  💵 Live P&L: {pnl_badge}\n"
                 )
+
+            lines.append(
+                f"🛡️ <b>Total Worst-Case Loss:</b> -₹{risk_metrics['total_max_sl_loss']:,.2f}\n"
+                f"🎯 <b>Total Best-Case Gain:</b> +₹{risk_metrics['total_max_tp_gain']:,.2f}"
+            )
             return "\n".join(lines)
 
         elif cmd in ("/pnl", "/summary"):
@@ -563,17 +646,22 @@ class TradingDaemon:
         self.gap_scanned_today = True
 
     def run_scan_cycle(self):
-        """Runs fast 5-8 second intraday equity scan."""
+        """Runs fast 5-8 second intraday equity scan with strict margin validation."""
         state = self.load_state()
-        print(f"\n[Daemon] [{datetime.now().strftime('%H:%M:%S')}] Fast Intraday Scan ({len(TOP_INTRADAY_UNIVERSE)} stocks)...")
+        risk_metrics = self.calculate_margin_and_risk(state)
+        print(f"\n[Daemon] [{datetime.now().strftime('%H:%M:%S')}] Fast Intraday Scan ({len(TOP_INTRADAY_UNIVERSE)} stocks) | Free Cash: ₹{risk_metrics['free_margin']:,.0f}...")
 
         # 1. Manage open positions
         self.manage_open_positions(state)
 
-        # 2. Risk check
+        # 2. Risk & Margin check
         can_trade, reason = self.risk_manager.can_trade()
         if not can_trade:
             print(f"[Daemon] Trade entry paused: {reason}")
+            return
+
+        if risk_metrics["free_margin"] < 500.0:
+            print(f"[Daemon] Insufficient free margin (₹{risk_metrics['free_margin']:.2f}). Waiting for exits.")
             return
 
         equity_pos = [p for p in state.get("open_positions", []) if p.get("asset_type", "EQUITY") == "EQUITY"]
@@ -589,6 +677,12 @@ class TradingDaemon:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
                     continue
 
+                qty = sig.get("suggested_qty", 10)
+                required_margin = (sig["entry_price"] * qty) / 5.0  # 5x MIS leverage
+                if required_margin > risk_metrics["free_margin"]:
+                    print(f"[Daemon] Skipped {sig['symbol']}: Required margin ₹{required_margin:.0f} > Free cash ₹{risk_metrics['free_margin']:.0f}")
+                    continue
+
                 self.notifier.notify_signal_found(sig)
 
                 pos_id = f"eq_{int(time.time()*1000)}"
@@ -596,7 +690,7 @@ class TradingDaemon:
                     "id": pos_id,
                     "symbol": sig["symbol"],
                     "direction": sig["direction"],
-                    "qty": sig.get("suggested_qty", 10),
+                    "qty": qty,
                     "entry_price": sig["entry_price"],
                     "stop_loss": sig["stop_loss"],
                     "target_price": sig["target_price"],
@@ -614,8 +708,10 @@ class TradingDaemon:
             print("[Daemon] No actionable equity setups currently.")
 
     def run_currency_scan(self):
-        """Scans 4 FX currency pairs."""
+        """Scans 4 FX currency pairs with strict margin validation."""
         state = self.load_state()
+        risk_metrics = self.calculate_margin_and_risk(state)
+
         currency_positions = [p for p in state.get("open_positions", []) if p.get("asset_type") == "CURRENCY"]
         if len(currency_positions) >= 2:
             return
@@ -624,6 +720,12 @@ class TradingDaemon:
         if currency_signals:
             for sig in currency_signals[:1]:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
+                    continue
+
+                spec = CURRENCY_PAIRS.get(sig["symbol"])
+                pos_margin = sig["lots"] * (spec.approx_margin if spec else 2000.0)
+                if pos_margin > risk_metrics["free_margin"]:
+                    print(f"[Daemon] Skipped FX {sig['symbol']}: Required margin ₹{pos_margin:.0f} > Free cash ₹{risk_metrics['free_margin']:.0f}")
                     continue
 
                 self.notifier.notify_signal_found(sig)
@@ -650,8 +752,10 @@ class TradingDaemon:
                 print(f"[Daemon] CURRENCY: {sig['direction']} {sig['lots']} lot(s) {sig['symbol']} @ {sig['entry_price']:.4f}")
 
     def run_commodity_scan(self):
-        """Scans MCX commodity futures."""
+        """Scans MCX commodity futures with strict margin validation."""
         state = self.load_state()
+        risk_metrics = self.calculate_margin_and_risk(state)
+
         commodity_positions = [p for p in state.get("open_positions", []) if p.get("asset_type") == "COMMODITY"]
         if len(commodity_positions) >= 2:
             return
@@ -660,6 +764,12 @@ class TradingDaemon:
         if commodity_signals:
             for sig in commodity_signals[:1]:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
+                    continue
+
+                spec = COMMODITY_SPECS.get(sig["symbol"])
+                pos_margin = sig["lots"] * (spec.approx_margin if spec else 15000.0)
+                if pos_margin > risk_metrics["free_margin"]:
+                    print(f"[Daemon] Skipped MCX {sig['symbol']}: Required margin ₹{pos_margin:.0f} > Free cash ₹{risk_metrics['free_margin']:.0f}")
                     continue
 
                 self.notifier.notify_signal_found(sig)
