@@ -36,6 +36,7 @@ from trading.commodity_strategy import (
 )
 from trading.patterns import analyze_3hour_patterns
 from trading.charges import calculate_trade_charges
+from trading.swing_radar import scan_swing_radar, get_swing_directional_bias, SwingObservation
 
 IST = pytz.timezone("Asia/Kolkata")
 JOURNAL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "paper_positions.json")
@@ -506,6 +507,48 @@ class TradingDaemon:
             lines.append("💡 <i>High ATR% ensures rapid intraday target/SL hits without consolidation.</i>")
             return "\n".join(lines)
 
+        elif cmd in ("/swing", "/radar", "/observation"):
+            obs_list = scan_swing_radar()
+            if not obs_list:
+                return "ℹ️ No high-conviction multi-week swing setups currently."
+
+            lines = ["🔭 <b>MULTI-WEEK SWING OBSERVATION RADAR</b>\n━━━━━━━━━━━━━━━━━━━"]
+            for o in obs_list[:5]:
+                icon = "🟢 <b>BULLISH</b>" if o.swing_direction == "BULLISH" else "🔴 <b>BEARISH</b>"
+                tag = "🛢️ MCX" if o.asset_type == "COMMODITY" else ("💱 FX" if o.asset_type == "CURRENCY" else "📊 EQ")
+                lines.append(
+                    f"{tag} <b>#{o.symbol}</b> | {icon} (Conf: {o.confidence}%)\n"
+                    f"  ⏱️ <b>Horizon:</b> {o.time_horizon_weeks} Weeks | 🎯 <b>Target:</b> ₹{o.projected_target:,.2f} ({o.potential_return_pct:+.1f}%)\n"
+                    f"  🕯️ <b>Catalyst:</b> <code>{o.catalyst_pattern}</code>\n"
+                    f"  💡 <b>Vehicle:</b> <b>{o.recommended_vehicle}</b>\n"
+                    f"  🎯 <b>Intraday Bias:</b> <code>{o.intraday_bias}</code>\n"
+                )
+
+            lines.append("💡 <i>Observation Stack: Forecasts multi-week swings & feeds macro bias to intraday execution.</i>")
+            lines.append("<i>Type /fno to view specific Options & Futures trade simulations.</i>")
+            return "\n".join(lines)
+
+        elif cmd == "/fno":
+            obs_list = scan_swing_radar()
+            if not obs_list:
+                return "ℹ️ No F&O swing setups available currently."
+
+            lines = ["📊 <b>F&O DERIVATIVES & SWING SIMULATION</b>\n━━━━━━━━━━━━━━━━━━━"]
+            for o in obs_list[:4]:
+                icon = "🟢" if o.swing_direction == "BULLISH" else "🔴"
+                lines.append(
+                    f"{icon} <b>#{o.symbol}</b> (LTP: ₹{o.current_price:,.2f} ➔ Target: ₹{o.projected_target:,.2f})\n"
+                    f"  🎯 <b>Target Move:</b> {o.potential_return_pct:+.1f}% in {o.time_horizon_weeks} Weeks\n"
+                    f"  📞 <b>Option Setup:</b> Buy <b>{o.option_strike}</b> @ ~₹{o.option_approx_premium:.2f} ({o.option_lot_size}x)\n"
+                    f"     • Max Risk (Premium): <b>₹{o.option_capital_required:,.0f}</b>\n"
+                    f"     • Projected Gain: <b>+₹{o.option_projected_profit:,.0f}</b>\n"
+                    f"  ⚡ <b>Futures Setup:</b> Margin: ₹{o.futures_margin_required:,.0f} | Projected Gain: <b>+₹{o.futures_projected_profit:,.0f}</b>\n"
+                    f"  🛡️ <b>Cash Equity SL:</b> ₹{o.projected_stop_loss:,.2f}\n"
+                )
+
+            lines.append("💡 <i>F&O simulations model leverage & asymmetric option payoffs for swing trades.</i>")
+            return "\n".join(lines)
+
         elif cmd == "/help":
             return (
                 f"🤖 <b>ATLAS BOT COMMANDS</b>\n"
@@ -514,6 +557,8 @@ class TradingDaemon:
                 f"📊 /status — Demat capital, used margin & scenario risk\n"
                 f"💰 /pnl — Today's closed trades & realized profit\n"
                 f"📜 /report — Full historical trade audit journal\n"
+                f"🔭 /swing — Multi-Week Swing Observation Radar (1-4w)\n"
+                f"📊 /fno — Options & Futures swing trade simulations\n"
                 f"⚡ /volatility — Top explosive high-volatility runners\n"
                 f"🕯️ /patterns — 3-Hour Candlestick & Chart Patterns\n"
                 f"🔍 /scan — Trigger fast intraday scan now\n"
@@ -524,7 +569,7 @@ class TradingDaemon:
                 f"➕ /adduser &lt;id&gt; — Authorize new trading friend"
             )
 
-        return "Commands: /status, /positions, /pnl, /report, /volatility, /patterns, /scan, /gaps, /currency, /commodities, /users, /help"
+        return "Commands: /status, /positions, /pnl, /report, /swing, /fno, /volatility, /patterns, /scan, /gaps, /currency, /commodities, /users, /help"
 
     # ─── 3. High-Speed Intraday Scanning (5-8 Seconds) ────────────
 
@@ -574,6 +619,32 @@ class TradingDaemon:
                 asset_type = p.get("asset_type", "EQUITY")
                 cur_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
                 
+                # ─── 1. Trailing Stop-Loss to Breakeven + Fees (+50% Target Rule) ───
+                if not p.get("sl_trailed_to_cost", False):
+                    if p["direction"] == "BUY":
+                        target_dist = p["target_price"] - p["entry_price"]
+                        if cur_price >= p["entry_price"] + (target_dist * 0.5):
+                            p["stop_loss"] = round(p["entry_price"] * 1.001, 2)  # Entry + estimated fees
+                            p["sl_trailed_to_cost"] = True
+                            print(f"[Daemon] 🎯 Trailed SL to Cost on {p['symbol']} @ ₹{p['stop_loss']:.2f} (+50% target reached!)")
+                    else:
+                        target_dist = p["entry_price"] - p["target_price"]
+                        if cur_price <= p["entry_price"] - (target_dist * 0.5):
+                            p["stop_loss"] = round(p["entry_price"] * 0.999, 2)
+                            p["sl_trailed_to_cost"] = True
+                            print(f"[Daemon] 🎯 Trailed SL to Cost on {p['symbol']} @ ₹{p['stop_loss']:.2f} (+50% target reached!)")
+
+                # ─── 2. Target 1 (1:1.0 R:R) Check ───
+                target_1 = p.get("target_1")
+                if target_1 and not p.get("t1_booked", False):
+                    hit_t1 = (cur_price >= target_1) if p["direction"] == "BUY" else (cur_price <= target_1)
+                    if hit_t1:
+                        p["t1_booked"] = True
+                        p["stop_loss"] = round(p["entry_price"] * 1.001, 2) if p["direction"] == "BUY" else round(p["entry_price"] * 0.999, 2)
+                        p["sl_trailed_to_cost"] = True
+                        print(f"[Daemon] 💰 Target 1 (1:1 R:R) Reached on {p['symbol']} @ ₹{cur_price:.2f}! Secured gains & locked SL to cost.")
+
+                # ─── 3. Full Target or Stop Loss Check ───
                 hit_tp = False
                 hit_sl = False
 
@@ -606,8 +677,8 @@ class TradingDaemon:
                         "net_pnl": round(chg.net_pnl, 2),
                         "pnl": round(chg.net_pnl, 2),  # Default pnl is Net Take-Home
                         "charges_breakdown": chg.to_dict(),
-                        "result": "WIN" if chg.net_pnl > 0 else "LOSS",
-                        "status": "TAKE_PROFIT" if hit_tp else "STOP_LOSS",
+                        "result": "WIN" if chg.net_pnl > 0 else ("LOSS" if chg.net_pnl < 0 else "BREAKEVEN"),
+                        "status": "TAKE_PROFIT" if hit_tp else ("TRAILING_SL_HIT" if p.get("sl_trailed_to_cost") else "STOP_LOSS"),
                     }
 
                     state.setdefault("trade_history", []).insert(0, closed)
@@ -741,6 +812,15 @@ class TradingDaemon:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
                     continue
 
+                # ─── Macro-to-Micro Alignment: Check Multi-Week Swing Bias ───
+                macro_bias = get_swing_directional_bias(sig["symbol"])
+                if macro_bias == "ONLY_BUY_DIPS" and sig["direction"] == "SELL":
+                    print(f"[Daemon] Skipped {sig['symbol']} SHORT: Conflicts with Multi-Week Bullish Swing Radar.")
+                    continue
+                elif macro_bias == "ONLY_SELL_RALLIES" and sig["direction"] == "BUY":
+                    print(f"[Daemon] Skipped {sig['symbol']} LONG: Conflicts with Multi-Week Bearish Swing Radar.")
+                    continue
+
                 qty = sig.get("suggested_qty", 10)
                 required_margin = (sig["entry_price"] * qty) / 5.0  # 5x MIS leverage
                 if required_margin > risk_metrics["free_margin"]:
@@ -758,6 +838,8 @@ class TradingDaemon:
                     "entry_price": sig["entry_price"],
                     "stop_loss": sig["stop_loss"],
                     "target_price": sig["target_price"],
+                    "target_1": sig.get("target_1", sig["target_price"]),
+                    "target_2": sig.get("target_2", sig["target_price"]),
                     "mode": self.mode,
                     "asset_type": "EQUITY",
                     "strategy": sig.get("strategy", "INTRADAY"),
@@ -911,18 +993,33 @@ class TradingDaemon:
                     self.run_commodity_scan()
                     time.sleep(self.scan_interval)
 
-                # 09:15 – 09:30: Gap Opening Scan + First Equity Scan
-                elif MARKET_OPEN <= now_time < dt_time(9, 30):
-                    print(f"\n[{time_str}] >> GAP OPENING + FAST EQUITY SCAN (09:15-09:30)")
-                    self.run_gap_scan()
-                    self.run_scan_cycle()
-                    time.sleep(self.scan_interval)
-
-                # 09:30 – 15:15: Regular Intraday Scans
-                elif dt_time(9, 30) <= now_time <= MARKET_CLOSE:
+                # 09:15 – 11:00: Morning Momentum Kill Zone
+                elif MARKET_OPEN <= now_time < dt_time(11, 0):
                     state = self.load_state()
                     open_count = len(state.get("open_positions", []))
-                    print(f"\n[{time_str}] >> INTRADAY SCAN (Equities + FX + MCX) | Open: {open_count}")
+                    print(f"\n[{time_str}] >> ⚡ MORNING MOMENTUM KILL ZONE (09:15-11:00) | Open: {open_count}")
+                    if not self.gap_scanned_today and now_time >= dt_time(9, 15):
+                        self.run_gap_scan()
+                    self.run_scan_cycle()
+                    self.run_currency_scan()
+                    self.run_commodity_scan()
+                    time.sleep(self.scan_interval)
+
+                # 11:00 – 13:30: Mid-Day Chop Pause (No new equity entries)
+                elif dt_time(11, 0) <= now_time < dt_time(13, 30):
+                    state = self.load_state()
+                    open_count = len(state.get("open_positions", []))
+                    print(f"\n[{time_str}] >> ⏸️ MID-DAY CHOP PAUSE (11:00-13:30) | Open: {open_count} (Monitoring existing trades)")
+                    self.manage_open_positions(state)
+                    self.run_currency_scan()
+                    self.run_commodity_scan()
+                    time.sleep(self.scan_interval)
+
+                # 13:30 – 15:15: Afternoon Breakout Kill Zone (European Market Open)
+                elif dt_time(13, 30) <= now_time <= MARKET_CLOSE:
+                    state = self.load_state()
+                    open_count = len(state.get("open_positions", []))
+                    print(f"\n[{time_str}] >> ⚡ AFTERNOON BREAKOUT KILL ZONE (13:30-15:15) | Open: {open_count}")
                     self.run_scan_cycle()
                     self.run_currency_scan()
                     self.run_commodity_scan()

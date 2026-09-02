@@ -24,6 +24,7 @@ from .indicators import (
     calculate_atr_pure,
     calculate_volume_ratio_pure,
     calculate_volatility_profile,
+    calculate_vwap_pure,
 )
 from .patterns import analyze_3hour_patterns
 
@@ -35,15 +36,18 @@ class TradeSignal:
     confidence: int        # 0 to 100
     entry_price: float
     stop_loss: float
-    target_price: float
-    risk_reward: str
-    rationale: str
-    rsi2_value: float
-    rsi14_value: float
-    trend: str             # "BULLISH", "BEARISH", "SIDEWAYS"
-    atr_value: float
+    target_price: float    # Blended 1:1.5 target
+    target_1: float = 0.0  # 1:1.0 Target for 50% profit booking
+    target_2: float = 0.0  # 1:2.0 Target for 50% runner
+    risk_reward: str = "1:1.5"
+    rationale: str = ""
+    rsi2_value: float = 50.0
+    rsi14_value: float = 50.0
+    trend: str = "SIDEWAYS" # "BULLISH", "BEARISH", "SIDEWAYS"
+    atr_value: float = 0.0
     atr_pct: float = 0.0   # Normalized Volatility %
-    vol_regime: str = "MODERATE_VOLATILITY" # "HIGH_MOMENTUM_VOLATILITY", "LOW_VOLATILITY_CHOP"
+    vol_regime: str = "MODERATE_VOLATILITY"
+    vwap_value: float = 0.0
     pattern_3h: str = ""   # 3-Hour Candlestick/Chart Pattern
 
     def to_dict(self) -> dict:
@@ -54,6 +58,8 @@ class TradeSignal:
             "entry_price": round(self.entry_price, 2),
             "stop_loss": round(self.stop_loss, 2),
             "target_price": round(self.target_price, 2),
+            "target_1": round(self.target_1, 2),
+            "target_2": round(self.target_2, 2),
             "risk_reward": self.risk_reward,
             "rationale": self.rationale,
             "rsi2": round(self.rsi2_value, 1),
@@ -62,6 +68,7 @@ class TradeSignal:
             "atr": round(self.atr_value, 2),
             "atr_pct": round(self.atr_pct, 2),
             "vol_regime": self.vol_regime,
+            "vwap": round(self.vwap_value, 2),
             "pattern_3h": self.pattern_3h,
         }
 
@@ -164,6 +171,19 @@ def generate_signal(symbol: str, df) -> TradeSignal:
         confidence = 80 + pat_res.confidence_boost
         rationale = f"3H Pattern confirmation: {pattern_desc}"
 
+    # Calculate Intraday VWAP
+    vwap = calculate_vwap_pure(highs, lows, closes, volumes)
+
+    # Apply VWAP Institutional Orderflow Guard
+    if direction == "BUY" and price < vwap * 0.996:
+        direction = "NONE"
+        confidence = 0
+        rationale = f"Skipped: Long below VWAP (₹{price:.2f} < VWAP ₹{vwap:.2f}) - Bearish institutional orderflow."
+    elif direction == "SELL" and price > vwap * 1.004:
+        direction = "NONE"
+        confidence = 0
+        rationale = f"Skipped: Short above VWAP (₹{price:.2f} > VWAP ₹{vwap:.2f}) - Bullish institutional orderflow."
+
     # Apply Volatility Quality Filter: Eliminate low volatility chop
     if direction != "NONE":
         if not vol_prof["is_tradeable"]:
@@ -192,6 +212,8 @@ def generate_signal(symbol: str, df) -> TradeSignal:
             entry_price=price,
             stop_loss=0.0,
             target_price=0.0,
+            target_1=0.0,
+            target_2=0.0,
             risk_reward="1:1.5",
             rationale=rationale,
             rsi2_value=r2,
@@ -200,19 +222,26 @@ def generate_signal(symbol: str, df) -> TradeSignal:
             atr_value=curr_atr,
             atr_pct=atr_pct,
             vol_regime=vol_regime,
+            vwap_value=vwap,
             pattern_3h=pattern_desc,
         )
 
-    # Dynamic ATR Target and Stop Loss with minimum threshold to beat fees
+    # Dynamic Dual-Target & Stop Loss System
     min_dist = price * 0.008  # Minimum 0.8% move to beat fixed transaction friction
     sl_distance = max(curr_atr * 0.8, min_dist)
-    target_distance = sl_distance * 1.5
+    t1_distance = sl_distance * 1.0   # Target 1 (1:1.0 R:R - 50% partial exit)
+    t2_distance = sl_distance * 2.0   # Target 2 (1:2.0 R:R - 50% runner)
+    target_distance = sl_distance * 1.5 # Blended
 
     if direction == "BUY":
         stop_loss = max(price - sl_distance, price * 0.95)
+        target_1 = price + t1_distance
+        target_2 = price + t2_distance
         target_price = price + target_distance
     else:
         stop_loss = min(price + sl_distance, price * 1.05)
+        target_1 = price - t1_distance
+        target_2 = price - t2_distance
         target_price = price - target_distance
 
     return TradeSignal(
@@ -222,6 +251,8 @@ def generate_signal(symbol: str, df) -> TradeSignal:
         entry_price=price,
         stop_loss=stop_loss,
         target_price=target_price,
+        target_1=target_1,
+        target_2=target_2,
         risk_reward="1:1.5",
         rationale=rationale,
         rsi2_value=r2,
@@ -230,6 +261,7 @@ def generate_signal(symbol: str, df) -> TradeSignal:
         atr_value=curr_atr,
         atr_pct=atr_pct,
         vol_regime=vol_regime,
+        vwap_value=vwap,
         pattern_3h=pattern_desc,
     )
 

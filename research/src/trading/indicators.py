@@ -185,9 +185,26 @@ def calculate_ema(series, period: int):
     return series.ewm(span=period, adjust=False).mean()
 
 
+def calculate_vwap_pure(highs: list[float], lows: list[float], closes: list[float], volumes: list[int | float]) -> float:
+    """Calculates Volume Weighted Average Price (VWAP) in pure Python."""
+    if not closes or not volumes:
+        return closes[-1] if closes else 0.0
+    cum_pv = 0.0
+    cum_vol = 0.0
+    for h, l, c, v in zip(highs, lows, closes, volumes):
+        typical_price = (h + l + c) / 3.0
+        cum_pv += typical_price * v
+        cum_vol += v
+    return (cum_pv / cum_vol) if cum_vol > 0 else closes[-1]
+
+
 def calculate_vwap(df):
     if not HAS_PANDAS or not isinstance(df, pd.DataFrame):
-        return [row["close"] for row in df]
+        highs = [row["high"] for row in df] if isinstance(df, list) else list(df)
+        lows = [row["low"] for row in df] if isinstance(df, list) else list(df)
+        closes = [row["close"] for row in df] if isinstance(df, list) else list(df)
+        volumes = [row["volume"] for row in df] if isinstance(df, list) else [1.0] * len(closes)
+        return calculate_vwap_pure(highs, lows, closes, volumes)
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     cum_tp_vol = (typical_price * df["volume"]).cumsum()
     cum_vol = df["volume"].cumsum()
