@@ -23,3 +23,5 @@ Thumbs.db
 research/src/paper_positions.json
 research/src/swing_watchlist.json
 research/src/trading/authorized_users.json
+research/src/news_cache.json
+research/src/panic_state.json

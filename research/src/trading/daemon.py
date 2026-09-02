@@ -37,6 +37,10 @@ from trading.commodity_strategy import (
 from trading.patterns import analyze_3hour_patterns
 from trading.charges import calculate_trade_charges
 from trading.swing_radar import scan_swing_radar, get_swing_directional_bias, SwingObservation
+from trading.news_radar import (
+    scan_news_feeds, is_stock_blocked_by_news, should_exit_position,
+    update_panic_state, get_blocked_sectors, get_blocked_stocks, NewsAlert,
+)
 
 IST = pytz.timezone("Asia/Kolkata")
 JOURNAL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "paper_positions.json")
@@ -56,7 +60,7 @@ class TradingDaemon:
     def __init__(self, scan_interval_seconds: int = 180, mode: str = "PAPER"):
         self.scan_interval = scan_interval_seconds
         self.mode = mode
-        self.risk_manager = RiskManager(capital=10000.0)
+        self.risk_manager = RiskManager(capital=150000.0)
         self.notifier = TelegramNotifier()
         self.is_running = True
         self.state_lock = threading.Lock()
@@ -64,6 +68,8 @@ class TradingDaemon:
         self.gap_scanned_today = False
         self.currency_square_off_done = False
         self.equity_square_off_done = False
+        self.last_news_scan_time = 0.0  # epoch timestamp of last news scan
+        self.news_scan_interval = 900   # scan news every 15 minutes
 
     def load_state(self) -> dict:
         with self.state_lock:
@@ -549,6 +555,42 @@ class TradingDaemon:
             lines.append("💡 <i>F&O simulations model leverage & asymmetric option payoffs for swing trades.</i>")
             return "\n".join(lines)
 
+        elif cmd == "/news":
+            # Trigger a fresh news scan
+            try:
+                alerts = scan_news_feeds()
+                update_panic_state(alerts)
+            except Exception:
+                alerts = []
+
+            blocked = get_blocked_sectors()
+            if not alerts and not blocked:
+                return "✅ No market-moving news detected. All sectors clear for trading."
+
+            lines = ["📰 <b>NEWS & PANIC RADAR STATUS</b>\n━━━━━━━━━━━━━━━━━━━"]
+
+            if blocked:
+                lines.append(f"🚫 <b>Blocked Sectors Today:</b> {', '.join(blocked)}")
+                blocked_stocks = get_blocked_stocks()
+                if blocked_stocks:
+                    lines.append(f"  ⛔ Affected Symbols: {', '.join(list(blocked_stocks)[:15])}")
+                lines.append("")
+
+            if alerts:
+                lines.append(f"📊 <b>Active Alerts ({len(alerts)} found):</b>\n")
+                for a in alerts[:6]:
+                    sev_icon = "🔴" if a.severity >= 8 else ("🟡" if a.severity >= 6 else "⚪")
+                    lines.append(
+                        f"{sev_icon} <b>[{a.severity}/10]</b> {a.headline[:100]}\n"
+                        f"  📡 {a.source} | 🔑 {', '.join(a.panic_keywords_found[:3])}\n"
+                        f"  🏭 {', '.join(a.affected_sectors[:4])} | Action: <b>{a.action}</b>\n"
+                    )
+            else:
+                lines.append("✅ No panic-level headlines detected in current feed scan.")
+
+            lines.append("\n💡 <i>News is scanned every 15 minutes. Severity ≥8 triggers auto-exit.</i>")
+            return "\n".join(lines)
+
         elif cmd == "/help":
             return (
                 f"🤖 <b>ATLAS BOT COMMANDS</b>\n"
@@ -565,6 +607,7 @@ class TradingDaemon:
                 f"⚡ /gaps — 9:15 AM Gap Openings scanner\n"
                 f"💱 /currency — Live Currency Futures setups\n"
                 f"🛢️ /commodities — Live MCX setups (Crude/Silver/Gold)\n"
+                f"📰 /news — Live News & Panic Radar (auto-blocks sectors)\n"
                 f"👥 /users — View whitelisted users\n"
                 f"➕ /adduser &lt;id&gt; — Authorize new trading friend"
             )
@@ -616,6 +659,17 @@ class TradingDaemon:
         remaining = []
         for p in open_pos:
             try:
+                # ─── 0. News Panic Emergency Exit Check ───
+                should_force_exit, exit_reason = should_exit_position(p["symbol"])
+                if should_force_exit:
+                    self._close_position(state, p, "NEWS_PANIC_EXIT")
+                    self.notifier.send_message(
+                        f"⛔ <b>NEWS PANIC EXIT:</b> {p['symbol']} ({p['direction']})\n"
+                        f"Reason: {exit_reason}"
+                    )
+                    print(f"[Daemon] 🚨 EMERGENCY EXIT {p['symbol']}: {exit_reason}")
+                    continue
+
                 asset_type = p.get("asset_type", "EQUITY")
                 cur_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
                 
@@ -755,6 +809,12 @@ class TradingDaemon:
                 if len(state.get("open_positions", [])) >= 8:
                     break
 
+                # ─── News Panic Radar: Block entries in threatened sectors ───
+                is_blocked, block_reason = is_stock_blocked_by_news(g["symbol"])
+                if is_blocked:
+                    print(f"[Daemon] 🚨 Skipped GAP {g['symbol']}: {block_reason}")
+                    continue
+
                 qty, risk_inr, status_msg = self.risk_manager.calculate_position_size(
                     g["entry_price"], g["stop_loss"], "EQUITY", 1
                 )
@@ -839,6 +899,12 @@ class TradingDaemon:
                     print(f"[Daemon] Skipped {sig['symbol']} LONG: Conflicts with Multi-Week Bearish Swing Radar.")
                     continue
 
+                # ─── News Panic Radar: Block entries in threatened sectors ───
+                is_blocked, block_reason = is_stock_blocked_by_news(sig["symbol"])
+                if is_blocked:
+                    print(f"[Daemon] 🚨 Skipped {sig['symbol']}: {block_reason}")
+                    continue
+
                 qty, risk_inr, status_msg = self.risk_manager.calculate_position_size(
                     sig["entry_price"], sig["stop_loss"], "EQUITY", 1
                 )
@@ -891,6 +957,12 @@ class TradingDaemon:
         if currency_signals:
             for sig in currency_signals[:2]:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
+                    continue
+
+                # ─── News Panic Radar: Block entries in threatened sectors ───
+                is_blocked, block_reason = is_stock_blocked_by_news(sig["symbol"])
+                if is_blocked:
+                    print(f"[Daemon] 🚨 Skipped FX {sig['symbol']}: {block_reason}")
                     continue
 
                 lots, risk_inr, status_msg = self.risk_manager.calculate_position_size(
@@ -948,6 +1020,12 @@ class TradingDaemon:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
                     continue
 
+                # ─── News Panic Radar: Block entries in threatened sectors ───
+                is_blocked, block_reason = is_stock_blocked_by_news(sig["symbol"])
+                if is_blocked:
+                    print(f"[Daemon] 🚨 Skipped MCX {sig['symbol']}: {block_reason}")
+                    continue
+
                 spec = COMMODITY_SPECS.get(sig["symbol"])
                 lot_mult = spec.lot_size if spec else 10
 
@@ -990,6 +1068,77 @@ class TradingDaemon:
                 self.save_state(state)
                 self.notifier.notify_trade_executed(new_pos)
                 print(f"[Daemon] MCX: {sig['direction']} {lots} lot(s) {sig['symbol']} @ ₹{sig['entry_price']:,.1f} (Risk: ₹{risk_inr:.0f})")
+
+    def run_news_scan(self):
+        """
+        Scans financial news RSS feeds for government policy changes, regulatory
+        actions, and black-swan events. If severity >= 8, immediately exits open
+        positions in the affected sector and blocks new entries for the day.
+        Called every 15 minutes during market hours.
+        """
+        now = time.time()
+        if (now - self.last_news_scan_time) < self.news_scan_interval:
+            return  # Too soon, skip
+        self.last_news_scan_time = now
+
+        try:
+            alerts = scan_news_feeds()
+            if not alerts:
+                return
+
+            # Update persistent panic state file for blocking new entries
+            update_panic_state(alerts)
+
+            # Filter only severe alerts (severity >= 7)
+            severe = [a for a in alerts if a.severity >= 7]
+            if not severe:
+                return
+
+            # ─── 1. Send Telegram Alert for Top Panic Headlines ───
+            lines = ["🚨 <b>NEWS PANIC RADAR ALERT</b>\n━━━━━━━━━━━━━━━━━━━"]
+            for a in severe[:5]:
+                sev_icon = "🔴" if a.severity >= 8 else "🟡"
+                action_tag = {
+                    "EXIT_POSITIONS": "⛔ FORCE EXIT",
+                    "BLOCK_ENTRIES": "🚫 BLOCK NEW ENTRIES",
+                    "MONITOR": "👁️ MONITOR",
+                }.get(a.action, "ℹ️")
+                lines.append(
+                    f"{sev_icon} <b>Severity {a.severity}/10</b> | {action_tag}\n"
+                    f"  📰 <i>{a.headline[:120]}</i>\n"
+                    f"  📡 Source: {a.source}\n"
+                    f"  🏭 Sectors: {', '.join(a.affected_sectors[:5])}\n"
+                    f"  🔑 Keywords: {', '.join(a.panic_keywords_found[:4])}\n"
+                )
+            self.notifier.send_message("\n".join(lines))
+
+            # ─── 2. Emergency Exit: Force-close positions in panic sectors ───
+            exit_alerts = [a for a in severe if a.action == "EXIT_POSITIONS"]
+            if exit_alerts:
+                state = self.load_state()
+                open_pos = state.get("open_positions", [])
+                remaining = []
+                force_closed = 0
+
+                for p in open_pos:
+                    should_exit, reason = should_exit_position(p["symbol"])
+                    if should_exit:
+                        self._close_position(state, p, "NEWS_PANIC_EXIT")
+                        force_closed += 1
+                        self.notifier.send_message(
+                            f"⛔ <b>NEWS PANIC EXIT:</b> {p['symbol']} ({p['direction']})\n"
+                            f"Reason: {reason}"
+                        )
+                    else:
+                        remaining.append(p)
+
+                if force_closed > 0:
+                    state["open_positions"] = remaining
+                    self.save_state(state)
+                    print(f"[News Radar] Force-exited {force_closed} position(s) due to panic news.")
+
+        except Exception as e:
+            print(f"[News Radar] Error scanning news: {e}")
 
     # ─── 6. Dedicated Concurrent Threads ─────────────────────────
 
@@ -1038,6 +1187,7 @@ class TradingDaemon:
                     self.currency_square_off_done = False
                     self.equity_square_off_done = False
                     print(f"\n[{time_str}] >> CURRENCY & COMMODITY OPEN (09:00-09:15)")
+                    self.run_news_scan()
                     self.run_currency_scan()
                     self.run_commodity_scan()
                     time.sleep(self.scan_interval)
@@ -1047,6 +1197,7 @@ class TradingDaemon:
                     state = self.load_state()
                     open_count = len(state.get("open_positions", []))
                     print(f"\n[{time_str}] >> ⚡ MORNING MOMENTUM KILL ZONE (09:15-11:00) | Open: {open_count}")
+                    self.run_news_scan()
                     if not self.gap_scanned_today and now_time >= dt_time(9, 15):
                         self.run_gap_scan()
                     self.run_scan_cycle()
@@ -1059,6 +1210,7 @@ class TradingDaemon:
                     state = self.load_state()
                     open_count = len(state.get("open_positions", []))
                     print(f"\n[{time_str}] >> ⏸️ MID-DAY CHOP PAUSE (11:00-13:30) | Open: {open_count} (Monitoring existing trades)")
+                    self.run_news_scan()
                     self.manage_open_positions(state)
                     self.run_currency_scan()
                     self.run_commodity_scan()
@@ -1069,6 +1221,7 @@ class TradingDaemon:
                     state = self.load_state()
                     open_count = len(state.get("open_positions", []))
                     print(f"\n[{time_str}] >> ⚡ AFTERNOON BREAKOUT KILL ZONE (13:30-15:15) | Open: {open_count}")
+                    self.run_news_scan()
                     self.run_scan_cycle()
                     self.run_currency_scan()
                     self.run_commodity_scan()
@@ -1148,9 +1301,10 @@ class TradingDaemon:
     def run(self):
         """Entry point: starts both concurrent threads."""
         print("==================================================")
-        print("   PROJECT ATLAS — AUTONOMOUS MULTI-ASSET BOT v3  ")
+        print("   PROJECT ATLAS — AUTONOMOUS MULTI-ASSET BOT v4  ")
         print(f"   Equities: 181 Stocks (Top 40 Fast) | FX: 4 Pairs | MCX: 5 Assets")
         print(f"   Mode: {self.mode} | Dual-Threaded Concurrency: ACTIVE")
+        print(f"   News & Panic Radar: ARMED (15-min cycle)")
         print(f"   Telegram Users: {len(self.notifier.chat_ids)} Authorized")
         print("==================================================")
 

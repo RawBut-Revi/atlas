@@ -72,8 +72,8 @@
     },
     {
       "id": "mcx_1788158915723",
-      "symbol": "COPPERM",
-      "name": "Copper Mini",
+      "symbol": "COPPER",
+      "name": "Copper",
       "direction": "BUY",
       "lots": 1,
       "qty": 1,
@@ -87,21 +87,21 @@
       "status": "STOP_LOSS",
       "exit_price": 861.27,
       "exit_time": "2026-09-02 09:18:16",
-      "gross_pnl": -1912.5,
-      "charges": 41.83,
-      "net_pnl": -1954.33,
-      "pnl": -1954.33,
+      "gross_pnl": -19125.0,
+      "charges": 418.25,
+      "net_pnl": -19543.25,
+      "pnl": -19543.25,
       "charges_breakdown": {
-        "gross_pnl": -1912.5,
-        "net_pnl": -1954.33,
-        "total_charges": 41.83,
+        "gross_pnl": -19125.0,
+        "net_pnl": -19543.25,
+        "total_charges": 418.25,
         "brokerage": 40.0,
         "stt": 215.32,
         "exchange_charges": 90.83,
         "gst": 24.33,
         "sebi_charges": 4.33,
         "stamp_duty": 43.45,
-        "total_turnover": 432547.5,
+        "total_turnover": 4325475.0,
         "breakeven_points": 0.1673
       },
       "result": "LOSS"
@@ -248,8 +248,8 @@
     }
   ],
   "capital": 150000.0,
-  "total_pnl": 3260.54,
-  "total_gross_pnl": 3615.6,
-  "total_charges_paid": 355.06,
-  "total_net_pnl": 3260.54
+  "total_pnl": -14328.38,
+  "total_gross_pnl": -13596.9,
+  "total_charges_paid": 731.48,
+  "total_net_pnl": -14328.38
 }
