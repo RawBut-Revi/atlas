@@ -286,10 +286,11 @@ class TradingDaemon:
                 f"🔢 <b>Total Trades:</b> {total_trades}",
                 f"✅ Wins: {wins} | ❌ Losses: {losses} | ⚪ Breakeven: {breakevens}",
                 f"🎯 <b>Win Rate:</b> {wr}%\n",
-                f"💰 <b>Gross Trading P&L:</b> <code>₹{gross_pnl:+.2f}</code>",
+                f"💰 <b>Today's Gross P&L:</b> <code>₹{gross_pnl:+.2f}</code>",
                 f"🧾 <b>Brokerage & Taxes:</b> <code>-₹{total_fees:.2f}</code>",
-                f"💵 <b>Net Take-Home P&L:</b> <b>₹{net_pnl:+.2f}</b>",
-                f"💼 <b>Closing Capital:</b> ₹{state.get('capital', 10000) + net_pnl:,.2f}\n",
+                f"💵 <b>Today's Net P&L:</b> <b>₹{net_pnl:+.2f}</b>",
+                f"📊 <b>Cumulative Net P&L:</b> <b>₹{state.get('total_pnl', 0.0):+.2f}</b>",
+                f"💼 <b>Current Demat Balance:</b> <b>₹{risk_metrics['total_capital']:,.2f}</b>\n",
             ]
 
             if closed_today:
