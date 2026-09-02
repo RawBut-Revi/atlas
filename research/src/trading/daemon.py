@@ -444,14 +444,77 @@ class TradingDaemon:
 
             return "\n".join(lines)
 
+        elif cmd in ("/volatility", "/movers"):
+            today = datetime.now().strftime("%Y-%m-%d")
+            from_date = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+
+            lines = ["⚡ <b>TOP HIGH-VOLATILITY RUNNERS (ATR% RANKED)</b>\n━━━━━━━━━━━━━━━━━━━"]
+            vol_list = []
+
+            # 1. MCX Commodities
+            for sym, spec in COMMODITY_SPECS.items():
+                try:
+                    c_data = fetch_commodity_data(sym, days=30)
+                    if c_data and len(c_data) >= 15:
+                        h = [x["high"] for x in c_data]
+                        l = [x["low"] for x in c_data]
+                        c = [x["close"] for x in c_data]
+                        v_prof = calculate_volatility_profile(h, l, c)
+                        vol_list.append({
+                            "symbol": sym,
+                            "name": spec.name,
+                            "tag": "🛢️ MCX",
+                            "price": c[-1],
+                            "atr_pct": v_prof["atr_pct"],
+                            "exp": v_prof["expansion_ratio"],
+                            "regime": v_prof["regime"],
+                        })
+                except Exception:
+                    continue
+
+            # 2. NSE Equities
+            for sym in TOP_INTRADAY_UNIVERSE[:25]:
+                try:
+                    df = fetch_historical_data(sym, from_date, today)
+                    if df is not None and len(df) >= 20:
+                        h = list(df["high"]) if HAS_PANDAS and isinstance(df, pd.DataFrame) else [x["high"] for x in df]
+                        l = list(df["low"]) if HAS_PANDAS and isinstance(df, pd.DataFrame) else [x["low"] for x in df]
+                        c = list(df["close"]) if HAS_PANDAS and isinstance(df, pd.DataFrame) else [x["close"] for x in df]
+                        v = list(df["volume"]) if HAS_PANDAS and isinstance(df, pd.DataFrame) else [x["volume"] for x in df]
+                        v_prof = calculate_volatility_profile(h, l, c, v)
+                        vol_list.append({
+                            "symbol": sym,
+                            "name": sym,
+                            "tag": "📊 EQ",
+                            "price": c[-1],
+                            "atr_pct": v_prof["atr_pct"],
+                            "exp": v_prof["expansion_ratio"],
+                            "regime": v_prof["regime"],
+                        })
+                except Exception:
+                    continue
+
+            vol_list.sort(key=lambda x: x["atr_pct"], reverse=True)
+
+            for item in vol_list[:8]:
+                badge = "🔥 Explosive" if item["atr_pct"] >= 2.5 else ("⚡ High" if item["atr_pct"] >= 1.8 else "⚪ Mod")
+                lines.append(
+                    f"{item['tag']} <b>{item['symbol']}</b>: ₹{item['price']:,.1f}\n"
+                    f"  ATR%: <b>{item['atr_pct']:.2f}%</b> ({badge}) | Range Exp: {item['exp']:.1f}x\n"
+                )
+
+            lines.append("💡 <i>High ATR% ensures rapid intraday target/SL hits without consolidation.</i>")
+            return "\n".join(lines)
+
         elif cmd == "/help":
             return (
                 f"🤖 <b>ATLAS BOT COMMANDS</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
                 f"⚡ /positions — Live open trades & unrealized P&L\n"
-                f"📊 /status — Engine status, capital & market telemetry\n"
+                f"📊 /status — Demat capital, used margin & scenario risk\n"
                 f"💰 /pnl — Today's closed trades & realized profit\n"
                 f"📜 /report — Full historical trade audit journal\n"
+                f"⚡ /volatility — Top explosive high-volatility runners\n"
                 f"🕯️ /patterns — 3-Hour Candlestick & Chart Patterns\n"
                 f"🔍 /scan — Trigger fast intraday scan now\n"
                 f"⚡ /gaps — 9:15 AM Gap Openings scanner\n"
@@ -461,12 +524,12 @@ class TradingDaemon:
                 f"➕ /adduser &lt;id&gt; — Authorize new trading friend"
             )
 
-        return "Commands: /status, /positions, /pnl, /report, /patterns, /scan, /gaps, /currency, /commodities, /users, /help"
+        return "Commands: /status, /positions, /pnl, /report, /volatility, /patterns, /scan, /gaps, /currency, /commodities, /users, /help"
 
     # ─── 3. High-Speed Intraday Scanning (5-8 Seconds) ────────────
 
     def scan_universe(self) -> list[dict]:
-        """Scans top liquid stocks in parallel with 20 threads (< 8 seconds)."""
+        """Scans top liquid stocks in parallel with 20 threads (< 8 seconds), sorted by Volatility."""
         today = datetime.now().strftime("%Y-%m-%d")
         from_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
 
@@ -493,7 +556,8 @@ class TradingDaemon:
                 if res is not None:
                     results.append(res)
 
-        results.sort(key=lambda s: s["confidence"], reverse=True)
+        # Prioritize high ATR% movers with high confidence
+        results.sort(key=lambda s: s.get("atr_pct", 1.0) * (s["confidence"] / 100.0), reverse=True)
         return results
 
     # ─── 4. Position Management & Safe Exits ─────────────────────

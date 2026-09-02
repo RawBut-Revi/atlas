@@ -23,6 +23,7 @@ from .indicators import (
     calculate_ema_pure,
     calculate_atr_pure,
     calculate_volume_ratio_pure,
+    calculate_volatility_profile,
 )
 from .patterns import analyze_3hour_patterns
 
@@ -41,6 +42,8 @@ class TradeSignal:
     rsi14_value: float
     trend: str             # "BULLISH", "BEARISH", "SIDEWAYS"
     atr_value: float
+    atr_pct: float = 0.0   # Normalized Volatility %
+    vol_regime: str = "MODERATE_VOLATILITY" # "HIGH_MOMENTUM_VOLATILITY", "LOW_VOLATILITY_CHOP"
     pattern_3h: str = ""   # 3-Hour Candlestick/Chart Pattern
 
     def to_dict(self) -> dict:
@@ -57,6 +60,8 @@ class TradeSignal:
             "rsi14": round(self.rsi14_value, 1),
             "trend": self.trend,
             "atr": round(self.atr_value, 2),
+            "atr_pct": round(self.atr_pct, 2),
+            "vol_regime": self.vol_regime,
             "pattern_3h": self.pattern_3h,
         }
 
@@ -100,6 +105,11 @@ def generate_signal(symbol: str, df) -> TradeSignal:
     e50 = ema50_list[-1]
     if curr_atr <= 0:
         curr_atr = price * 0.015
+
+    # Volatility Assessment & Consolidation Filter
+    vol_prof = calculate_volatility_profile(highs, lows, closes, volumes)
+    atr_pct = vol_prof["atr_pct"]
+    vol_regime = vol_prof["regime"]
 
     # 3-Hour Candlestick & Chart Pattern Analysis
     pat_res = analyze_3hour_patterns(symbol, df)
@@ -154,6 +164,16 @@ def generate_signal(symbol: str, df) -> TradeSignal:
         confidence = 80 + pat_res.confidence_boost
         rationale = f"3H Pattern confirmation: {pattern_desc}"
 
+    # Apply Volatility Quality Filter: Eliminate low volatility chop
+    if direction != "NONE":
+        if not vol_prof["is_tradeable"]:
+            direction = "NONE"
+            confidence = 0
+            rationale = f"Skipped: Low Volatility Consolidation Chop (ATR%: {atr_pct:.2f}% < 1.6%). High risk of intraday freeze/scratch."
+        elif vol_regime == "HIGH_MOMENTUM_VOLATILITY":
+            confidence = min(95, confidence + 8)
+            rationale = f"🔥 High-Volatility Runner (ATR%: {atr_pct:.2f}%, Exp: {vol_prof['expansion_ratio']:.1f}x) | {rationale}"
+
     # Apply 3H Pattern Confluence Boost if pattern aligns with trade direction
     if direction == "BUY" and pat_res.bias == "BULLISH":
         confidence = min(95, confidence + pat_res.confidence_boost)
@@ -178,11 +198,14 @@ def generate_signal(symbol: str, df) -> TradeSignal:
             rsi14_value=r14,
             trend=trend,
             atr_value=curr_atr,
+            atr_pct=atr_pct,
+            vol_regime=vol_regime,
             pattern_3h=pattern_desc,
         )
 
-    # Risk-Reward 1:1.5 with ATR
-    sl_distance = curr_atr * 0.75
+    # Dynamic ATR Target and Stop Loss with minimum threshold to beat fees
+    min_dist = price * 0.008  # Minimum 0.8% move to beat fixed transaction friction
+    sl_distance = max(curr_atr * 0.8, min_dist)
     target_distance = sl_distance * 1.5
 
     if direction == "BUY":
@@ -205,6 +228,8 @@ def generate_signal(symbol: str, df) -> TradeSignal:
         rsi14_value=r14,
         trend=trend,
         atr_value=curr_atr,
+        atr_pct=atr_pct,
+        vol_regime=vol_regime,
         pattern_3h=pattern_desc,
     )
 
