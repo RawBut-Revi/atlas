@@ -738,21 +738,34 @@ class TradingDaemon:
     # ─── 5. Scanning Loops ────────────────────────────────────────
 
     def run_gap_scan(self):
-        """Runs 9:15 AM Gap opening detection across all 181 stocks."""
+        """Runs 9:15 AM Gap opening detection across all 181 stocks with Fixed-Risk Sizing."""
         if self.gap_scanned_today:
             return
 
         print(f"\n[Daemon] [{datetime.now().strftime('%H:%M:%S')}] Running Early Market GAP Scanner (181 Stocks)...")
         state = self.load_state()
+        risk_metrics = self.calculate_margin_and_risk(state)
 
         gap_signals = scan_for_gaps()
         if gap_signals:
             print(f"[Daemon] Found {len(gap_signals)} gap openings!")
-            for g in gap_signals[:2]:
+            for g in gap_signals[:4]:
                 if any(p["symbol"] == g["symbol"] for p in state.get("open_positions", [])):
                     continue
-                if len(state.get("open_positions", [])) >= 4:
+                if len(state.get("open_positions", [])) >= 8:
                     break
+
+                qty, risk_inr, status_msg = self.risk_manager.calculate_position_size(
+                    g["entry_price"], g["stop_loss"], "EQUITY", 1
+                )
+                if status_msg != "APPROVED" or qty <= 0:
+                    print(f"[Daemon] Skipped GAP {g['symbol']}: {status_msg}")
+                    continue
+
+                required_margin = (g["entry_price"] * qty) / 5.0
+                if required_margin > risk_metrics["free_margin"]:
+                    print(f"[Daemon] Skipped GAP {g['symbol']}: Required margin ₹{required_margin:.0f} > Free cash ₹{risk_metrics['free_margin']:.0f}")
+                    continue
 
                 self.notifier.notify_signal_found(g)
 
@@ -761,10 +774,12 @@ class TradingDaemon:
                     "id": pos_id,
                     "symbol": g["symbol"],
                     "direction": g["direction"],
-                    "qty": 10,
+                    "qty": qty,
                     "entry_price": g["entry_price"],
                     "stop_loss": g["stop_loss"],
                     "target_price": g["target_price"],
+                    "target_1": g.get("target_1", g["target_price"]),
+                    "target_2": g.get("target_2", g["target_price"]),
                     "mode": self.mode,
                     "asset_type": "EQUITY",
                     "strategy": g["strategy"],
@@ -772,16 +787,17 @@ class TradingDaemon:
                     "status": "OPEN",
                 }
                 state.setdefault("open_positions", []).append(new_pos)
+                risk_metrics["free_margin"] -= required_margin
                 self.save_state(state)
                 self.notifier.notify_trade_executed(new_pos)
-                print(f"[Daemon] GAP {g['strategy']}: {g['direction']} {g['symbol']} | Gap: {g['gap_pct']:+.1f}%")
+                print(f"[Daemon] GAP {g['strategy']}: {g['direction']} {qty}x {g['symbol']} @ ₹{g['entry_price']} (Risk: ₹{risk_inr:.0f})")
         else:
             print("[Daemon] No significant gap openings detected today.")
 
         self.gap_scanned_today = True
 
     def run_scan_cycle(self):
-        """Runs fast 5-8 second intraday equity scan with strict margin validation."""
+        """Runs fast 5-8 second intraday equity scan with Universal Fixed-Risk validation."""
         state = self.load_state()
         risk_metrics = self.calculate_margin_and_risk(state)
         print(f"\n[Daemon] [{datetime.now().strftime('%H:%M:%S')}] Fast Intraday Scan ({len(TOP_INTRADAY_UNIVERSE)} stocks) | Free Cash: ₹{risk_metrics['free_margin']:,.0f}...")
@@ -795,20 +811,22 @@ class TradingDaemon:
             print(f"[Daemon] Trade entry paused: {reason}")
             return
 
-        if risk_metrics["free_margin"] < 500.0:
+        if risk_metrics["free_margin"] < 1000.0:
             print(f"[Daemon] Insufficient free margin (₹{risk_metrics['free_margin']:.2f}). Waiting for exits.")
             return
 
         equity_pos = [p for p in state.get("open_positions", []) if p.get("asset_type", "EQUITY") == "EQUITY"]
-        if len(equity_pos) >= 2:
-            print("[Daemon] Max equity positions (2) reached. Monitoring.")
+        if len(equity_pos) >= 4:
+            print("[Daemon] Max equity positions (4) reached. Monitoring.")
             return
 
         # 3. Fast scan
         signals = self.scan_universe()
         if signals:
             print(f"[Daemon] Found {len(signals)} high-confidence setups!")
-            for sig in signals[:1]:
+            for sig in signals[:3]:
+                if len(state.get("open_positions", [])) >= 8:
+                    break
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
                     continue
 
@@ -821,7 +839,13 @@ class TradingDaemon:
                     print(f"[Daemon] Skipped {sig['symbol']} LONG: Conflicts with Multi-Week Bearish Swing Radar.")
                     continue
 
-                qty = sig.get("suggested_qty", 10)
+                qty, risk_inr, status_msg = self.risk_manager.calculate_position_size(
+                    sig["entry_price"], sig["stop_loss"], "EQUITY", 1
+                )
+                if status_msg != "APPROVED" or qty <= 0:
+                    print(f"[Daemon] Skipped {sig['symbol']}: {status_msg}")
+                    continue
+
                 required_margin = (sig["entry_price"] * qty) / 5.0  # 5x MIS leverage
                 if required_margin > risk_metrics["free_margin"]:
                     print(f"[Daemon] Skipped {sig['symbol']}: Required margin ₹{required_margin:.0f} > Free cash ₹{risk_metrics['free_margin']:.0f}")
@@ -847,14 +871,15 @@ class TradingDaemon:
                     "status": "OPEN",
                 }
                 state.setdefault("open_positions", []).append(new_pos)
+                risk_metrics["free_margin"] -= required_margin
                 self.save_state(state)
                 self.notifier.notify_trade_executed(new_pos)
-                print(f"[Daemon] Executed {self.mode} {sig['direction']} {new_pos['qty']}x {sig['symbol']} @ ₹{sig['entry_price']}")
+                print(f"[Daemon] Executed {self.mode} {sig['direction']} {qty}x {sig['symbol']} @ ₹{sig['entry_price']} (Risk: ₹{risk_inr:.0f})")
         else:
             print("[Daemon] No actionable equity setups currently.")
 
     def run_currency_scan(self):
-        """Scans 4 FX currency pairs with strict margin validation."""
+        """Scans 4 FX currency pairs with Universal Fixed-Risk validation."""
         state = self.load_state()
         risk_metrics = self.calculate_margin_and_risk(state)
 
@@ -864,16 +889,24 @@ class TradingDaemon:
 
         currency_signals = scan_all_currency_pairs()
         if currency_signals:
-            for sig in currency_signals[:1]:
+            for sig in currency_signals[:2]:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
                     continue
 
+                lots, risk_inr, status_msg = self.risk_manager.calculate_position_size(
+                    sig["entry_price"], sig["stop_loss"], "CURRENCY", 1000
+                )
+                if status_msg != "APPROVED" or lots <= 0:
+                    print(f"[Daemon] Skipped FX {sig['symbol']}: {status_msg}")
+                    continue
+
                 spec = CURRENCY_PAIRS.get(sig["symbol"])
-                pos_margin = sig["lots"] * (spec.approx_margin if spec else 2000.0)
+                pos_margin = lots * (spec.approx_margin if spec else 2000.0)
                 if pos_margin > risk_metrics["free_margin"]:
                     print(f"[Daemon] Skipped FX {sig['symbol']}: Required margin ₹{pos_margin:.0f} > Free cash ₹{risk_metrics['free_margin']:.0f}")
                     continue
 
+                sig["lots"] = lots
                 self.notifier.notify_signal_found(sig)
 
                 pos_id = f"fx_{int(time.time()*1000)}"
@@ -881,11 +914,13 @@ class TradingDaemon:
                     "id": pos_id,
                     "symbol": sig["symbol"],
                     "direction": sig["direction"],
-                    "lots": sig["lots"],
-                    "qty": sig["lots"],
+                    "lots": lots,
+                    "qty": lots,
                     "entry_price": sig["entry_price"],
                     "stop_loss": sig["stop_loss"],
                     "target_price": sig["target_price"],
+                    "target_1": sig.get("target_1", sig["target_price"]),
+                    "target_2": sig.get("target_2", sig["target_price"]),
                     "mode": self.mode,
                     "asset_type": "CURRENCY",
                     "strategy": sig["strategy"],
@@ -893,12 +928,13 @@ class TradingDaemon:
                     "status": "OPEN",
                 }
                 state.setdefault("open_positions", []).append(new_pos)
+                risk_metrics["free_margin"] -= pos_margin
                 self.save_state(state)
                 self.notifier.notify_trade_executed(new_pos)
-                print(f"[Daemon] CURRENCY: {sig['direction']} {sig['lots']} lot(s) {sig['symbol']} @ {sig['entry_price']:.4f}")
+                print(f"[Daemon] CURRENCY: {sig['direction']} {lots} lot(s) {sig['symbol']} @ {sig['entry_price']:.4f} (Risk: ₹{risk_inr:.0f})")
 
     def run_commodity_scan(self):
-        """Scans MCX commodity futures with strict margin validation."""
+        """Scans MCX commodity futures with Universal Fixed-Risk & Multiplier Cap."""
         state = self.load_state()
         risk_metrics = self.calculate_margin_and_risk(state)
 
@@ -908,16 +944,26 @@ class TradingDaemon:
 
         commodity_signals = scan_all_commodities()
         if commodity_signals:
-            for sig in commodity_signals[:1]:
+            for sig in commodity_signals[:2]:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
                     continue
 
                 spec = COMMODITY_SPECS.get(sig["symbol"])
-                pos_margin = sig["lots"] * (spec.approx_margin if spec else 15000.0)
+                lot_mult = spec.lot_size if spec else 10
+
+                lots, risk_inr, status_msg = self.risk_manager.calculate_position_size(
+                    sig["entry_price"], sig["stop_loss"], "COMMODITY", lot_mult
+                )
+                if status_msg != "APPROVED" or lots <= 0:
+                    print(f"[Daemon] Skipped MCX {sig['symbol']}: {status_msg}")
+                    continue
+
+                pos_margin = lots * (spec.approx_margin if spec else 15000.0)
                 if pos_margin > risk_metrics["free_margin"]:
                     print(f"[Daemon] Skipped MCX {sig['symbol']}: Required margin ₹{pos_margin:.0f} > Free cash ₹{risk_metrics['free_margin']:.0f}")
                     continue
 
+                sig["lots"] = lots
                 self.notifier.notify_signal_found(sig)
 
                 pos_id = f"mcx_{int(time.time()*1000)}"
@@ -926,11 +972,13 @@ class TradingDaemon:
                     "symbol": sig["symbol"],
                     "name": sig.get("name", sig["symbol"]),
                     "direction": sig["direction"],
-                    "lots": sig["lots"],
-                    "qty": sig["lots"],
+                    "lots": lots,
+                    "qty": lots,
                     "entry_price": sig["entry_price"],
                     "stop_loss": sig["stop_loss"],
                     "target_price": sig["target_price"],
+                    "target_1": sig.get("target_1", sig["target_price"]),
+                    "target_2": sig.get("target_2", sig["target_price"]),
                     "mode": self.mode,
                     "asset_type": "COMMODITY",
                     "strategy": sig["strategy"],
@@ -938,9 +986,10 @@ class TradingDaemon:
                     "status": "OPEN",
                 }
                 state.setdefault("open_positions", []).append(new_pos)
+                risk_metrics["free_margin"] -= pos_margin
                 self.save_state(state)
                 self.notifier.notify_trade_executed(new_pos)
-                print(f"[Daemon] MCX: {sig['direction']} {sig['lots']} lot(s) {sig['symbol']} @ ₹{sig['entry_price']:,.1f}")
+                print(f"[Daemon] MCX: {sig['direction']} {lots} lot(s) {sig['symbol']} @ ₹{sig['entry_price']:,.1f} (Risk: ₹{risk_inr:.0f})")
 
     # ─── 6. Dedicated Concurrent Threads ─────────────────────────
 

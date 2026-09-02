@@ -58,10 +58,15 @@ COMMODITY_SPECS = {
         lot_size=100, unit="Grams", tick_size=1.0, tick_value=10.0,
         approx_margin=22000.0, inr_price_factor=18.5,  # e.g. $4530 * 18.5 = ~₹83,800/10g
     ),
-    "COPPER": CommoditySpec(
-        symbol="COPPER", name="Copper", yfinance_ticker="HG=F",
-        lot_size=2500, unit="kg", tick_size=0.05, tick_value=125.0,
+    "COPPERM": CommoditySpec(
+        symbol="COPPERM", name="Copper Mini", yfinance_ticker="HG=F",
+        lot_size=250, unit="kg", tick_size=0.05, tick_value=12.5,
         approx_margin=28000.0, inr_price_factor=130.0,  # e.g. $6.65 * 130 = ~₹864/kg
+    ),
+    "COPPER": CommoditySpec(
+        symbol="COPPER", name="Copper Mini", yfinance_ticker="HG=F",
+        lot_size=250, unit="kg", tick_size=0.05, tick_value=12.5,
+        approx_margin=28000.0, inr_price_factor=130.0,
     ),
 }
 

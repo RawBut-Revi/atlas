@@ -34,12 +34,12 @@ class TradeRecord:
 
 @dataclass
 class RiskManager:
-    """Manages position sizing, daily loss tracking, and trade validation."""
+    """Manages universal position sizing, daily loss tracking, and multi-asset trade validation."""
 
-    capital: float = 10000.0
-    risk_per_trade_pct: float = 2.0   # Risk 2% of capital per trade
-    max_daily_loss_pct: float = 3.0   # Stop trading if daily loss > 3%
-    max_positions: int = 3            # Max simultaneous positions
+    capital: float = 150000.0          # Updated demat capital ₹1,50,000
+    risk_per_trade_pct: float = 1.5   # Risk 1.5% of capital per trade (₹2,250 max loss)
+    max_daily_loss_pct: float = 4.0   # Stop trading if daily loss > 4% (₹6,000)
+    max_positions: int = 8            # Max simultaneous positions across all assets
     mis_leverage: float = 5.0         # Upstox MIS leverage
     trades_today: list = field(default_factory=list)
     open_positions: list = field(default_factory=list)
@@ -50,7 +50,7 @@ class RiskManager:
 
     @property
     def risk_per_trade(self) -> float:
-        return self.capital * self.risk_per_trade_pct / 100
+        return self.capital * self.risk_per_trade_pct / 100.0  # ₹2,250.00
 
     @property
     def daily_pnl(self) -> float:
@@ -58,20 +58,53 @@ class RiskManager:
 
     @property
     def daily_loss_limit(self) -> float:
-        return self.capital * self.max_daily_loss_pct / 100
+        return self.capital * self.max_daily_loss_pct / 100.0
 
-    def calculate_qty(self, entry_price: float, stop_loss: float) -> int:
+    def calculate_position_size(
+        self,
+        entry_price: float,
+        stop_loss: float,
+        asset_type: str = "EQUITY",
+        lot_multiplier: int = 1,
+    ) -> tuple[int, float, str]:
         """
-        Calculate position size: risk amount / stop-loss distance.
-        E.g., ₹200 risk / ₹5 SL = 40 shares.
+        Universal Fixed-Risk Position Sizing & Contract Multiplier Cap Engine.
+        Returns: (allowed_units_or_lots, estimated_max_loss_in_rupees, status_message)
         """
         sl_distance = abs(entry_price - stop_loss)
         if sl_distance <= 0:
-            return 0
-        qty = int(self.risk_per_trade / sl_distance)
-        # Check we don't exceed buying power
-        max_qty = int(self.buying_power / entry_price)
-        return min(qty, max_qty, 500)  # Cap at 500 shares for safety
+            return 0, 0.0, "Invalid SL distance"
+
+        single_unit_risk = sl_distance * lot_multiplier
+        if single_unit_risk <= 0:
+            return 0, 0.0, "Invalid single unit risk"
+
+        # ─── Hard Risk Cap: If 1 Lot risks more than ₹2,250, REJECT! ───
+        if single_unit_risk > self.risk_per_trade:
+            return (
+                0,
+                single_unit_risk,
+                f"REJECTED: 1 Lot risks ₹{single_unit_risk:,.0f} > Max Budget ₹{self.risk_per_trade:,.0f}",
+            )
+
+        allowed_units = int(self.risk_per_trade / single_unit_risk)
+        allowed_units = max(1, allowed_units)
+
+        if asset_type == "EQUITY":
+            max_by_margin = int((self.buying_power * 0.3) / entry_price)  # Max 30% margin on single stock
+            allowed_units = min(allowed_units, max_by_margin, 250)
+        elif asset_type == "CURRENCY":
+            allowed_units = min(allowed_units, 10)  # Max 10 lots FX
+        elif asset_type == "COMMODITY":
+            allowed_units = min(allowed_units, 4)   # Max 4 lots MCX Mini
+
+        total_risk = round(allowed_units * single_unit_risk, 2)
+        return allowed_units, total_risk, "APPROVED"
+
+    def calculate_qty(self, entry_price: float, stop_loss: float) -> int:
+        """Helper for equity position sizing."""
+        qty, _, _ = self.calculate_position_size(entry_price, stop_loss, "EQUITY", 1)
+        return max(1, qty)
 
     def can_trade(self) -> tuple[bool, str]:
         """Check if we're allowed to take a new trade."""

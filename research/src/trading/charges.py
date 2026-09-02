@@ -77,7 +77,7 @@ def calculate_trade_charges(
         elif "GOLD" in symbol:
             multiplier = 100.0     # 100 grams
         elif "COPPER" in symbol:
-            multiplier = 2500.0    # 2,500 kg
+            multiplier = 250.0     # 250 kg per mini lot (COPPERM)
 
     units = qty_or_lots * multiplier
 
