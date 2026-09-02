@@ -18,3 +18,8 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Runtime trading state (prevents Git pull conflicts on mobile)
+research/src/paper_positions.json
+research/src/swing_watchlist.json
+research/src/trading/authorized_users.json
