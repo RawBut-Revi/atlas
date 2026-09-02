@@ -41,6 +41,7 @@ from trading.news_radar import (
     scan_news_feeds, is_stock_blocked_by_news, should_exit_position,
     update_panic_state, get_blocked_sectors, get_blocked_stocks, NewsAlert,
 )
+from screening.penny_screener import screen_penny_stocks, get_penny_stock_details
 
 IST = pytz.timezone("Asia/Kolkata")
 JOURNAL_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "paper_positions.json")
@@ -591,6 +592,45 @@ class TradingDaemon:
             lines.append("\n💡 <i>News is scanned every 15 minutes. Severity ≥8 triggers auto-exit.</i>")
             return "\n".join(lines)
 
+        elif cmd in ("/penny", "/pennystocks", "/multibaggers"):
+            cap = state.get("capital", 150000.0)
+            screener_res = screen_penny_stocks(total_portfolio_value=cap)
+            all_picks = screener_res.get("all_picks", [])
+
+            if not all_picks:
+                return "ℹ️ No penny stocks currently meet the strict Atlas Quality & Growth filters."
+
+            limits = screener_res.get("portfolio_limits", {})
+            lines = [
+                f"🚀 <b>ATLAS MULTIBAGGER PENNY STOCK RADAR</b>",
+                f"━━━━━━━━━━━━━━━━━━━",
+                f"🛡️ <b>Strict Allocation Limits (₹{cap:,.0f} Demat):</b>",
+                f"  • Max per stock (3%): <b>₹{limits.get('max_per_stock_inr', 4500):,.0f}</b>",
+                f"  • Max Penny Bucket (15%): <b>₹{limits.get('max_penny_allocation_inr', 22500):,.0f}</b>\n",
+                f"🏆 <b>TOP QUANT-RANKED PENNY PICKS:</b>\n"
+            ]
+
+            for p in all_picks[:5]:
+                cat_badge = {
+                    "growth_rocket": "🚀 Growth Rocket",
+                    "turnaround": "🔄 Turnaround",
+                    "hidden_gem": "💎 Hidden Gem",
+                }.get(p.get("category"), "📈 Smallcap")
+
+                score = p.get("penny_score", 0)
+                score_icon = "🟢" if score >= 78 else ("🟡" if score >= 62 else "⚪")
+
+                lines.append(
+                    f"{score_icon} <b>#{p['symbol']}</b> | Score: <b>{score:.0f}/100</b> ({cat_badge})\n"
+                    f"  💰 Price: ₹{p['price']} | MCap: ₹{p['market_cap_cr']} Cr | {p.get('sector', '')}\n"
+                    f"  📈 2Y Rev CAGR: <b>+{p.get('revenue_cagr_2y', 0):.1f}%</b> | Promoter: <b>{p.get('promoter_trend', 'stable')}</b> ({p.get('promoter_holding', 0):.0f}%)\n"
+                    f"  🎯 Reco Allocation: <b>₹{p.get('suggested_allocation_inr', 0):,.0f}</b> ({p.get('suggested_allocation_pct', 0):.1f}%)\n"
+                    f"  💡 <i>{p.get('known_for', '')}</i>\n"
+                )
+
+            lines.append("⚠️ <i>Penny stocks are for multi-month/year delivery growth, NOT intraday leverage. Max 15% demat capital!</i>")
+            return "\n".join(lines)
+
         elif cmd == "/help":
             return (
                 f"🤖 <b>ATLAS BOT COMMANDS</b>\n"
@@ -601,6 +641,7 @@ class TradingDaemon:
                 f"📜 /report — Full historical trade audit journal\n"
                 f"🔭 /swing — Multi-Week Swing Observation Radar (1-4w)\n"
                 f"📊 /fno — Options & Futures swing trade simulations\n"
+                f"🚀 /penny — Multibagger Penny Stock Radar (Growth & Turnarounds)\n"
                 f"⚡ /volatility — Top explosive high-volatility runners\n"
                 f"🕯️ /patterns — 3-Hour Candlestick & Chart Patterns\n"
                 f"🔍 /scan — Trigger fast intraday scan now\n"
@@ -612,7 +653,7 @@ class TradingDaemon:
                 f"➕ /adduser &lt;id&gt; — Authorize new trading friend"
             )
 
-        return "Commands: /status, /positions, /pnl, /report, /swing, /fno, /volatility, /patterns, /scan, /gaps, /currency, /commodities, /users, /help"
+        return "Commands: /status, /positions, /pnl, /report, /swing, /fno, /penny, /volatility, /patterns, /scan, /gaps, /currency, /commodities, /news, /users, /help"
 
     # ─── 3. High-Speed Intraday Scanning (5-8 Seconds) ────────────
 
