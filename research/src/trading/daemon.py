@@ -701,16 +701,21 @@ class TradingDaemon:
         remaining = []
         for p in open_pos:
             try:
-                # ─── 0. News Panic Emergency Exit Check ───
-                should_force_exit, exit_reason = should_exit_position(p["symbol"])
-                if should_force_exit:
+                # ─── 0. Directionally-Aware News Emergency Defense ───
+                news_action, exit_reason = should_exit_position(p["symbol"], p.get("direction", "BUY"))
+                if news_action == "EMERGENCY_EXIT":
                     self._close_position(state, p, "NEWS_PANIC_EXIT")
                     self.notifier.send_message(
-                        f"⛔ <b>NEWS PANIC EXIT:</b> {p['symbol']} ({p['direction']})\n"
+                        f"⛔ <b>NEWS ADVERSE SHOCK EXIT:</b> {p['symbol']} ({p['direction']})\n"
                         f"Reason: {exit_reason}"
                     )
-                    print(f"[Daemon] 🚨 EMERGENCY EXIT {p['symbol']}: {exit_reason}")
+                    print(f"[Daemon] 🚨 ADVERSE NEWS EXIT {p['symbol']} ({p['direction']}): {exit_reason}")
                     continue
+                elif news_action == "TRAIL_SL":
+                    if not p.get("sl_trailed_to_cost", False):
+                        p["stop_loss"] = round(p["entry_price"] * 1.001, 2) if p["direction"] == "BUY" else round(p["entry_price"] * 0.999, 2)
+                        p["sl_trailed_to_cost"] = True
+                        print(f"[Daemon] 🎯 Favorable News Shock: Trailed SL to Cost on {p['symbol']} ({p['direction']})")
 
                 asset_type = p.get("asset_type", "EQUITY")
                 cur_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
@@ -851,12 +856,6 @@ class TradingDaemon:
                 if len(state.get("open_positions", [])) >= 8:
                     break
 
-                # ─── News Panic Radar: Block entries in threatened sectors ───
-                is_blocked, block_reason = is_stock_blocked_by_news(g["symbol"])
-                if is_blocked:
-                    print(f"[Daemon] 🚨 Skipped GAP {g['symbol']}: {block_reason}")
-                    continue
-
                 qty, risk_inr, status_msg = self.risk_manager.calculate_position_size(
                     g["entry_price"], g["stop_loss"], "EQUITY", 1
                 )
@@ -941,12 +940,6 @@ class TradingDaemon:
                     print(f"[Daemon] Skipped {sig['symbol']} LONG: Conflicts with Multi-Week Bearish Swing Radar.")
                     continue
 
-                # ─── News Panic Radar: Block entries in threatened sectors ───
-                is_blocked, block_reason = is_stock_blocked_by_news(sig["symbol"])
-                if is_blocked:
-                    print(f"[Daemon] 🚨 Skipped {sig['symbol']}: {block_reason}")
-                    continue
-
                 qty, risk_inr, status_msg = self.risk_manager.calculate_position_size(
                     sig["entry_price"], sig["stop_loss"], "EQUITY", 1
                 )
@@ -999,12 +992,6 @@ class TradingDaemon:
         if currency_signals:
             for sig in currency_signals[:2]:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
-                    continue
-
-                # ─── News Panic Radar: Block entries in threatened sectors ───
-                is_blocked, block_reason = is_stock_blocked_by_news(sig["symbol"])
-                if is_blocked:
-                    print(f"[Daemon] 🚨 Skipped FX {sig['symbol']}: {block_reason}")
                     continue
 
                 lots, risk_inr, status_msg = self.risk_manager.calculate_position_size(
@@ -1060,12 +1047,6 @@ class TradingDaemon:
         if commodity_signals:
             for sig in commodity_signals[:2]:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
-                    continue
-
-                # ─── News Panic Radar: Block entries in threatened sectors ───
-                is_blocked, block_reason = is_stock_blocked_by_news(sig["symbol"])
-                if is_blocked:
-                    print(f"[Daemon] 🚨 Skipped MCX {sig['symbol']}: {block_reason}")
                     continue
 
                 spec = COMMODITY_SPECS.get(sig["symbol"])
@@ -1163,14 +1144,20 @@ class TradingDaemon:
                 force_closed = 0
 
                 for p in open_pos:
-                    should_exit, reason = should_exit_position(p["symbol"])
-                    if should_exit:
+                    action, reason = should_exit_position(p["symbol"], p.get("direction", "BUY"))
+                    if action == "EMERGENCY_EXIT":
                         self._close_position(state, p, "NEWS_PANIC_EXIT")
                         force_closed += 1
                         self.notifier.send_message(
-                            f"⛔ <b>NEWS PANIC EXIT:</b> {p['symbol']} ({p['direction']})\n"
+                            f"⛔ <b>NEWS ADVERSE SHOCK EXIT:</b> {p['symbol']} ({p['direction']})\n"
                             f"Reason: {reason}"
                         )
+                    elif action == "TRAIL_SL":
+                        if not p.get("sl_trailed_to_cost", False):
+                            p["stop_loss"] = round(p["entry_price"] * 1.001, 2) if p["direction"] == "BUY" else round(p["entry_price"] * 0.999, 2)
+                            p["sl_trailed_to_cost"] = True
+                            print(f"[News Radar] 🎯 Favorable News Shock: Trailed SL to Cost on {p['symbol']} ({p['direction']})")
+                        remaining.append(p)
                     else:
                         remaining.append(p)
 

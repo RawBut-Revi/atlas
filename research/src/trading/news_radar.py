@@ -356,20 +356,49 @@ def is_stock_blocked_by_news(symbol: str) -> tuple[bool, str]:
     return False, ""
 
 
-def should_exit_position(symbol: str) -> tuple[bool, str]:
+def should_exit_position(symbol: str, direction: str = "BUY") -> tuple[str, str]:
     """
-    Check if an open position should be force-exited due to severe panic news (severity >= 8).
+    Directionally-aware news defense for active open positions.
+    Returns: (action, reason)
+      - 'EMERGENCY_EXIT': Severe adverse regulatory/news shock against our position (e.g. Bearish GO on a Long).
+      - 'TRAIL_SL': News is favorable to our position (e.g. Bearish news on a Short) — lock SL to cost and let target run!
+      - 'HOLD': No actionable shock for this symbol.
     """
     if not os.path.exists(PANIC_STATE_FILE):
-        return False, ""
+        return "HOLD", ""
     try:
         with open(PANIC_STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if data.get("date") != datetime.now().strftime("%Y-%m-%d"):
-            return False, ""
+            return "HOLD", ""
+
         for alert in data.get("alerts", []):
-            if alert.get("action") == "EXIT_POSITIONS" and symbol in alert.get("affected_stocks", []):
-                return True, f"EMERGENCY EXIT: {alert['headline'][:80]}"
+            affected = alert.get("affected_stocks", [])
+            if symbol not in affected:
+                continue
+
+            severity = alert.get("severity", 0)
+            headline = alert.get("headline", "")
+            action = alert.get("action", "")
+
+            # Keywords indicating bullish vs bearish shock
+            bullish_triggers = ["rate cut", "upper circuit", "subsidy", "incentive", "tax cut", "duty cut"]
+            is_bullish_news = any(b in headline.lower() for b in bullish_triggers)
+
+            if severity >= 8:
+                if is_bullish_news:
+                    # Bullish shock: hurts Shorts, helps Longs
+                    if direction == "SELL":
+                        return "EMERGENCY_EXIT", f"ADVERSE BULLISH SHOCK: {headline[:80]}"
+                    else:
+                        return "TRAIL_SL", f"FAVORABLE MOMENTUM: {headline[:80]}"
+                else:
+                    # Bearish shock (majority of GOs/bans/panics): hurts Longs, helps Shorts
+                    if direction == "BUY":
+                        return "EMERGENCY_EXIT", f"ADVERSE BEARISH SHOCK: {headline[:80]}"
+                    else:
+                        return "TRAIL_SL", f"FAVORABLE MOMENTUM (SHORT): {headline[:80]}"
+
     except Exception:
         pass
-    return False, ""
+    return "HOLD", ""
