@@ -39,6 +39,7 @@ from trading.charges import calculate_trade_charges
 from trading.swing_radar import scan_swing_radar, get_swing_directional_bias, SwingObservation
 from trading.neural_markov import evaluate_trade_conviction, get_current_regime_status, RegimeState
 from trading.rl_optimizer import RLExecutionOptimizer, RLState, RLAction
+from trading.asset_threads import EquityThread, CurrencyThread, CommodityThread
 from screening.penny_screener import screen_penny_stocks, get_penny_stock_details
 
 IST = pytz.timezone("Asia/Kolkata")
@@ -1210,173 +1211,52 @@ class TradingDaemon:
             except Exception as e:
                 time.sleep(1.0)
 
-    def market_scheduler_thread(self):
-        """Dedicated thread for market scanning and execution."""
-        from datetime import time as dt_time
-        WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        heartbeat_counter = 0
-
-        while self.is_running:
-            try:
-                now_ist = datetime.now(IST)
-                now_time = now_ist.time()
-                weekday = now_ist.weekday()
-                is_weekday = weekday < 5
-                time_str = now_ist.strftime("%H:%M:%S")
-                heartbeat_counter += 1
-
-                if not is_weekday:
-                    if heartbeat_counter % 6 == 1:
-                        print(f"[{time_str}] Market closed (Weekend - {WEEKDAYS[weekday]}). Telegram command server ACTIVE.")
-                    time.sleep(10)
-                    continue
-
-                # 00:00 – 09:00: Before market
-                if now_time < CURRENCY_OPEN:
-                    if heartbeat_counter % 6 == 1:
-                        print(f"[{time_str}] Pre-market standby. Markets open at 09:00 AM IST.")
-                    time.sleep(10)
-                    continue
-
-                # 09:00 – 09:15: Currency & Commodity open
-                elif CURRENCY_OPEN <= now_time < MARKET_OPEN:
-                    self.daily_report_sent = False
-                    self.gap_scanned_today = False
-                    self.currency_square_off_done = False
-                    self.equity_square_off_done = False
-                    print(f"\n[{time_str}] >> CURRENCY & COMMODITY OPEN (09:00-09:15)")
-                    self.run_currency_scan()
-                    self.run_commodity_scan()
-                    time.sleep(self.scan_interval)
-
-                # 09:15 – 11:00: Morning Momentum Kill Zone
-                elif MARKET_OPEN <= now_time < dt_time(11, 0):
-                    state = self.load_state()
-                    open_count = len(state.get("open_positions", []))
-                    print(f"\n[{time_str}] >> ⚡ MORNING MOMENTUM KILL ZONE (09:15-11:00) | Open: {open_count}")
-                    if not self.gap_scanned_today and now_time >= dt_time(9, 15):
-                        self.run_gap_scan()
-                    self.run_scan_cycle()
-                    self.run_currency_scan()
-                    self.run_commodity_scan()
-                    time.sleep(self.scan_interval)
-
-                # 11:00 – 13:30: Mid-Day Chop Pause (No new equity entries)
-                elif dt_time(11, 0) <= now_time < dt_time(13, 30):
-                    state = self.load_state()
-                    open_count = len(state.get("open_positions", []))
-                    print(f"\n[{time_str}] >> ⏸️ MID-DAY CHOP PAUSE (11:00-13:30) | Open: {open_count} (Monitoring existing trades)")
-                    self.manage_open_positions(state)
-                    self.run_currency_scan()
-                    self.run_commodity_scan()
-                    time.sleep(self.scan_interval)
-
-                # 13:30 – 15:15: Afternoon Breakout Kill Zone (European Market Open)
-                elif dt_time(13, 30) <= now_time <= MARKET_CLOSE:
-                    state = self.load_state()
-                    open_count = len(state.get("open_positions", []))
-                    print(f"\n[{time_str}] >> ⚡ AFTERNOON BREAKOUT KILL ZONE (13:30-15:15) | Open: {open_count}")
-                    self.run_scan_cycle()
-                    self.run_currency_scan()
-                    self.run_commodity_scan()
-                    time.sleep(self.scan_interval)
-
-                # 15:15 – 15:25: Equity Square-off
-                elif MARKET_CLOSE < now_time <= SQUARE_OFF:
-                    if not self.equity_square_off_done:
-                        print(f"\n[{time_str}] >> 15:15 PM: SQUARING OFF ALL EQUITY POSITIONS")
-                        state = self.load_state()
-                        equity_positions = [p for p in state.get("open_positions", []) if p.get("asset_type", "EQUITY") == "EQUITY"]
-                        remaining = [p for p in state.get("open_positions", []) if p.get("asset_type", "EQUITY") != "EQUITY"]
-                        
-                        for p in equity_positions:
-                            self._close_position(state, p, "SQUARE_OFF")
-                        
-                        state["open_positions"] = remaining
-                        self.save_state(state)
-                        self.equity_square_off_done = True
-                        print(f"[{time_str}] Equity square-off complete. Currency & MCX continue.")
-                    time.sleep(30)
-
-                # 15:25 – 16:45: Currency & Commodity Window
-                elif SQUARE_OFF < now_time <= CURRENCY_SQUARE_OFF:
-                    self.run_currency_scan()
-                    self.run_commodity_scan()
-                    state = self.load_state()
-                    self.manage_open_positions(state)
-                    time.sleep(self.scan_interval)
-
-                # 16:45 – 17:00: Currency Square-off
-                elif CURRENCY_SQUARE_OFF < now_time <= CURRENCY_CLOSE:
-                    if not self.currency_square_off_done:
-                        print(f"\n[{time_str}] >> 16:45 PM: SQUARING OFF CURRENCY POSITIONS")
-                        state = self.load_state()
-                        fx_positions = [p for p in state.get("open_positions", []) if p.get("asset_type") == "CURRENCY"]
-                        remaining = [p for p in state.get("open_positions", []) if p.get("asset_type") != "CURRENCY"]
-                        
-                        for p in fx_positions:
-                            self._close_position(state, p, "SQUARE_OFF")
-                        
-                        state["open_positions"] = remaining
-                        self.save_state(state)
-                        self.currency_square_off_done = True
-                        print(f"[{time_str}] Currency square-off complete. MCX US Evening peak starts at 17:00.")
-                    time.sleep(30)
-
-                # 17:00 – 23:15: MCX US Evening Peak Window
-                elif MCX_US_SESSION_OPEN <= now_time <= MCX_SQUARE_OFF:
-                    self.run_commodity_scan()
-                    state = self.load_state()
-                    self.manage_open_positions(state)
-                    time.sleep(self.scan_interval)
-
-                # 23:15 – 23:30: MCX Square-off & EOD Master Summary
-                elif MCX_SQUARE_OFF < now_time <= MCX_CLOSE and not self.daily_report_sent:
-                    print(f"\n[{time_str}] >> 23:15 PM: FINAL MASTER SQUARE-OFF & DAILY REPORT")
-                    state = self.load_state()
-                    self.square_off_all(state)
-
-                    summary = self.risk_manager.get_daily_summary()
-                    summary["total_pnl"] = state.get("total_pnl", 0.0)
-                    self.notifier.notify_daily_summary(summary)
-                    self.daily_report_sent = True
-                    print(f"[{time_str}] Daily session concluded! Full master summary sent to Telegram.")
-                    time.sleep(60)
-
-                else:
-                    if heartbeat_counter % 6 == 1:
-                        print(f"[{time_str}] Off-market hours. Next session tomorrow 09:00 AM IST. Telegram server ACTIVE.")
-                    time.sleep(10)
-
-            except Exception as e:
-                print(f"[Market Engine] Loop exception: {e}")
-                time.sleep(10)
-
     def run(self):
-        """Entry point: starts both concurrent threads."""
+        """
+        Master Orchestrator: launches 4 dedicated concurrent threads:
+          1. TelegramServer: 24/7 Sub-second command handling
+          2. EquityThread: NSE Equities (09:15 - 15:15 IST, 180s cycle, isolated HMM)
+          3. CurrencyThread: NSE FX Pairs (09:00 - 16:45 IST, 90s cycle, isolated HMM)
+          4. CommodityThread: MCX Commodities (09:00 - 23:15 IST, 120s cycle, isolated HMM)
+        """
         print("==================================================")
-        print("   PROJECT ATLAS — AUTONOMOUS MULTI-ASSET BOT v4  ")
-        print(f"   Equities: 181 Stocks (Top 40 Fast) | FX: 4 Pairs | MCX: 5 Assets")
-        print(f"   Mode: {self.mode} | Dual-Threaded Concurrency: ACTIVE")
-        print(f"   News & Panic Radar: ARMED (15-min cycle)")
+        print("   PROJECT ATLAS — AUTONOMOUS MULTI-ASSET BOT v5  ")
+        print("   Architecture: Phase 3 Multi-Threaded Engine    ")
+        print("   Equities: 181 Stocks | FX: 4 Pairs | MCX: 5 Mini Assets")
+        print(f"   Mode: {self.mode} | 4 Concurrent Threads: ACTIVE")
+        print("   AI: Gaussian HMM + 18-MLP + PPO RL Optimizer")
         print(f"   Telegram Users: {len(self.notifier.chat_ids)} Authorized")
         print("==================================================")
 
-        # Start Thread 1: Telegram Server Thread
+        # 1. Telegram Polling Thread (24/7 Sub-second interactive commands)
         t_telegram = threading.Thread(target=self.telegram_polling_thread, name="TelegramServer", daemon=True)
         t_telegram.start()
 
-        # Start Thread 2: Market Scheduler Thread
-        t_scanner = threading.Thread(target=self.market_scheduler_thread, name="MarketScanner", daemon=True)
-        t_scanner.start()
+        # 2. Dedicated Equity Thread (NSE intraday scanning & MIS lifecycle)
+        t_equity = EquityThread(daemon_ref=self, scan_interval=self.scan_interval)
+        t_equity.start()
 
-        # Keep main thread alive
+        # 3. Dedicated Currency Thread (NSE CDS FX pairs)
+        t_currency = CurrencyThread(daemon_ref=self, scan_interval=90)
+        t_currency.start()
+
+        # 4. Dedicated Commodity Thread (MCX Full session until 23:15)
+        t_commodity = CommodityThread(daemon_ref=self, scan_interval=120)
+        t_commodity.start()
+
+        print("[Orchestrator] All 4 dedicated asset engines successfully launched and operational!")
+
+        # Keep main thread alive as Master Orchestrator
         try:
             while self.is_running:
                 time.sleep(1.0)
         except KeyboardInterrupt:
             print("\n[Daemon] Stopping Atlas trading bot...")
             self.is_running = False
+
+    def start(self):
+        """Alias for run() to support standard orchestrator interfaces."""
+        self.run()
 
 
 if __name__ == "__main__":
