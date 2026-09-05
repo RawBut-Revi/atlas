@@ -253,18 +253,22 @@ class TargetHitNeuralNet:
 
 # ─── 3. Unified Evaluator API ────────────────────────────────────────────────
 
-_global_hmm = GaussianMarketHMM()
-_global_nn = TargetHitNeuralNet()
-
-
-def evaluate_trade_conviction(signal: dict, df) -> dict:
+def evaluate_trade_conviction(
+    signal: dict,
+    df,
+    hmm_instance: Optional[GaussianMarketHMM] = None,
+    nn_instance: Optional[TargetHitNeuralNet] = None,
+) -> dict:
     """
     Evaluates a candidate trade signal through the Hybrid Neural-Markov engine.
-    
+    Supports thread-isolated HMM and Neural Net instances for thread-safe concurrent execution.
+
     Args:
         signal: Candidate trade dictionary from strategy.py
         df: Historical candles list or DataFrame
-        
+        hmm_instance: Optional isolated GaussianMarketHMM instance (for thread safety)
+        nn_instance: Optional isolated TargetHitNeuralNet instance
+
     Returns:
         {
             "approved": bool,             # True if P(Win) >= 0.78 and Regime != CHOP
@@ -283,6 +287,9 @@ def evaluate_trade_conviction(signal: dict, df) -> dict:
             "reason": "Invalid or missing signal data",
         }
 
+    hmm = hmm_instance or GaussianMarketHMM()
+    nn = nn_instance or TargetHitNeuralNet()
+
     # Extract price history
     if hasattr(df, "iloc"):
         closes = list(df["close"])
@@ -296,7 +303,7 @@ def evaluate_trade_conviction(signal: dict, df) -> dict:
     vwap = signal.get("vwap", closes[-1])
 
     # ─── Step 1: Infer Hidden Market Regime (Layer 1 HMM) ───
-    regime_state = _global_hmm.infer_regime(closes, highs, lows, vwap)
+    regime_state = hmm.infer_regime(closes, highs, lows, vwap)
 
     # ─── Step 2: Build 18-Feature Vector for Neural Network (Layer 2) ───
     direction = signal.get("direction", "BUY")
@@ -330,7 +337,7 @@ def evaluate_trade_conviction(signal: dict, df) -> dict:
     ]
 
     # ─── Step 3: Neural Network Forward Pass ───
-    win_prob = _global_nn.predict_target_hit_probability(features)
+    win_prob = nn.predict_target_hit_probability(features)
 
     # ─── Step 4: Decision Threshold ───
     # Reject if in dead sideways chop OR if target hit probability < 78%
@@ -353,9 +360,16 @@ def evaluate_trade_conviction(signal: dict, df) -> dict:
     }
 
 
-def get_current_regime_status(closes: list[float], highs: list[float], lows: list[float], vwap: float) -> dict:
+def get_current_regime_status(
+    closes: list[float],
+    highs: list[float],
+    lows: list[float],
+    vwap: float,
+    hmm_instance: Optional[GaussianMarketHMM] = None,
+) -> dict:
     """Helper for Telegram /regime command."""
-    st = _global_hmm.infer_regime(closes, highs, lows, vwap)
+    hmm = hmm_instance or GaussianMarketHMM()
+    st = hmm.infer_regime(closes, highs, lows, vwap)
     return {
         "regime": st.regime,
         "probabilities": st.probabilities,
