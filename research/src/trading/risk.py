@@ -66,9 +66,11 @@ class RiskManager:
         stop_loss: float,
         asset_type: str = "EQUITY",
         lot_multiplier: int = 1,
+        max_risk_budget: float = None,
     ) -> tuple[int, float, str]:
         """
-        Universal Fixed-Risk Position Sizing & Contract Multiplier Cap Engine.
+        Universal Position Sizing & Contract Multiplier Cap Engine.
+        Supports dynamic RL risk scaling via optional max_risk_budget.
         Returns: (allowed_units_or_lots, estimated_max_loss_in_rupees, status_message)
         """
         sl_distance = abs(entry_price - stop_loss)
@@ -79,15 +81,17 @@ class RiskManager:
         if single_unit_risk <= 0:
             return 0, 0.0, "Invalid single unit risk"
 
-        # ─── Hard Risk Cap: If 1 Lot risks more than ₹2,250, REJECT! ───
-        if single_unit_risk > self.risk_per_trade:
+        risk_budget = max_risk_budget if max_risk_budget is not None else self.risk_per_trade
+
+        # ─── Hard Risk Cap: If 1 Lot risks more than allowed budget, REJECT! ───
+        if single_unit_risk > risk_budget:
             return (
                 0,
                 single_unit_risk,
-                f"REJECTED: 1 Lot risks ₹{single_unit_risk:,.0f} > Max Budget ₹{self.risk_per_trade:,.0f}",
+                f"REJECTED: 1 Lot risks ₹{single_unit_risk:,.0f} > Max Budget ₹{risk_budget:,.0f}",
             )
 
-        allowed_units = int(self.risk_per_trade / single_unit_risk)
+        allowed_units = int(risk_budget / single_unit_risk)
         allowed_units = max(1, allowed_units)
 
         if asset_type == "EQUITY":
