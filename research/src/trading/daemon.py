@@ -713,7 +713,7 @@ class TradingDaemon:
 
     # ─── 4. Position Management & Safe Exits ─────────────────────
 
-    def manage_open_positions(self, state: dict):
+    def manage_open_positions(self, state: dict, asset_filter: str = None):
         """Checks open positions against Stop Loss and Take Profit levels."""
         open_pos = state.get("open_positions", [])
         if not open_pos:
@@ -721,8 +721,13 @@ class TradingDaemon:
 
         remaining = []
         for p in open_pos:
+            asset_type = p.get("asset_type", "EQUITY")
+            # If asset_filter is specified, leave other asset positions untouched for their respective threads
+            if asset_filter and asset_type != asset_filter:
+                remaining.append(p)
+                continue
+
             try:
-                asset_type = p.get("asset_type", "EQUITY")
                 cur_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
                 
                 # ─── 1. Trailing Stop-Loss to Breakeven + Fees (+50% Target Rule) ───
