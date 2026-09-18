@@ -185,6 +185,32 @@ def calculate_trade_charges(
     )
 
 
+MIN_EDGE_MULTIPLE = 2.0
+
+
+def passes_charges_filter(
+    symbol: str,
+    asset_type: str,
+    direction: str,
+    entry_price: float,
+    target_price: float,
+    qty_or_lots: int,
+    min_edge_multiple: float = MIN_EDGE_MULTIPLE,
+) -> tuple:
+    """
+    Charges-aware edge gate: a trade is only worth taking if the profit at target
+    is at least `min_edge_multiple` x the round-trip charges.
+
+    Uses signed gross P&L, so a target on the wrong side of entry yields a negative
+    expected profit and is rejected.
+
+    Returns (ok, expected_profit, estimated_charges).
+    """
+    est = calculate_trade_charges(symbol, asset_type, direction, entry_price, target_price, qty_or_lots)
+    ok = est.gross_pnl >= min_edge_multiple * est.total_charges
+    return ok, est.gross_pnl, est.total_charges
+
+
 if __name__ == "__main__":
     print("=== Testing Real-World Transaction Charges Engine ===")
     

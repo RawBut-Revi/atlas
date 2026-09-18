@@ -35,7 +35,7 @@ from trading.commodity_strategy import (
     MCX_OPEN, MCX_US_SESSION_OPEN, MCX_CLOSE, MCX_SQUARE_OFF,
 )
 from trading.patterns import analyze_3hour_patterns
-from trading.charges import calculate_trade_charges
+from trading.charges import calculate_trade_charges, passes_charges_filter, MIN_EDGE_MULTIPLE
 from trading.swing_radar import scan_swing_radar, get_swing_directional_bias, SwingObservation
 from trading.neural_markov import evaluate_trade_conviction, get_current_regime_status, RegimeState
 from trading.rl_optimizer import RLExecutionOptimizer, RLState, RLAction
@@ -871,6 +871,15 @@ class TradingDaemon:
 
     # ─── 5. Scanning Loops ────────────────────────────────────────
 
+    def passes_charges_filter(self, symbol, asset_type, direction, entry_price, target_price, qty_or_lots):
+        """Rejects trades whose profit at target cannot cover MIN_EDGE_MULTIPLE x round-trip charges."""
+        ok, expected_profit, est_charges = passes_charges_filter(
+            symbol, asset_type, direction, entry_price, target_price, qty_or_lots
+        )
+        if not ok:
+            print(f"[Charges Filter] REJECTED {symbol}: Expected ₹{expected_profit:.0f} < {MIN_EDGE_MULTIPLE:g}×Charges ₹{MIN_EDGE_MULTIPLE * est_charges:.0f}")
+        return ok
+
     def run_gap_scan(self):
         """Runs 9:15 AM Gap opening detection across all 181 stocks with Fixed-Risk Sizing."""
         if self.gap_scanned_today:
@@ -907,6 +916,9 @@ class TradingDaemon:
                 )
                 if status_msg != "APPROVED" or qty <= 0:
                     print(f"[Daemon] Skipped GAP {g['symbol']}: {status_msg}")
+                    continue
+
+                if not self.passes_charges_filter(g["symbol"], "EQUITY", g["direction"], g["entry_price"], g["target_price"], qty):
                     continue
 
                 required_margin = (g["entry_price"] * qty) / 5.0
@@ -1009,6 +1021,9 @@ class TradingDaemon:
                     print(f"[Daemon] Skipped {sig['symbol']}: {status_msg}")
                     continue
 
+                if not self.passes_charges_filter(sig["symbol"], "EQUITY", sig["direction"], sig["entry_price"], sig["target_price"], qty):
+                    continue
+
                 required_margin = (sig["entry_price"] * qty) / 5.0  # 5x MIS leverage
                 if required_margin > risk_metrics["free_margin"]:
                     print(f"[Daemon] Skipped {sig['symbol']}: Required margin ₹{required_margin:.0f} > Free cash ₹{risk_metrics['free_margin']:.0f}")
@@ -1082,6 +1097,9 @@ class TradingDaemon:
                 )
                 if status_msg != "APPROVED" or lots <= 0:
                     print(f"[Daemon] Skipped FX {sig['symbol']}: {status_msg}")
+                    continue
+
+                if not self.passes_charges_filter(sig["symbol"], "CURRENCY", sig["direction"], sig["entry_price"], sig["target_price"], lots):
                     continue
 
                 spec = CURRENCY_PAIRS.get(sig["symbol"])
@@ -1161,6 +1179,9 @@ class TradingDaemon:
                 )
                 if status_msg != "APPROVED" or lots <= 0:
                     print(f"[Daemon] Skipped MCX {sig['symbol']}: {status_msg}")
+                    continue
+
+                if not self.passes_charges_filter(sig["symbol"], "COMMODITY", sig["direction"], sig["entry_price"], sig["target_price"], lots):
                     continue
 
                 pos_margin = lots * (spec.approx_margin if spec else 15000.0)
