@@ -55,6 +55,13 @@ TOP_INTRADAY_UNIVERSE = [
     "INDUSINDBK", "GRASIM", "NESTLEIND", "CIPLA", "APOLLOHOSP", "DIVISLAB"
 ]
 
+# Strategies with proven negative edge over the first 183 paper trades. Blocked at entry only;
+# positions already open under these strategies are still managed and closed normally.
+DISABLED_STRATEGIES = frozenset({"INTRADAY", "US_SESSION_MOMENTUM", "GAP_FADE"})
+
+# generate_signal() emits no "strategy" key; equity entries are labelled with this default.
+DEFAULT_EQUITY_STRATEGY = "INTRADAY"
+
 
 class TradingDaemon:
     def __init__(self, scan_interval_seconds: int = 180, mode: str = "PAPER"):
@@ -601,7 +608,8 @@ class TradingDaemon:
                 f"🎯 <b>Active Algorithmic Rules:</b>",
                 f"  • Rejects all setups during <code>CHOP_CONSOLIDATION</code> (P(Chop) ≥ 65%)",
                 f"  • Multiplier Cap: Hard-rejects oversized contracts (e.g. Copper Standard)",
-                f"  • Max Daily Entries: Capped at 3 trades per symbol per day\n",
+                f"  • Max Daily Entries: Capped at 3 trades per symbol per day",
+                f"  • Disabled Strategies: <code>{', '.join(sorted(DISABLED_STRATEGIES))}</code>\n",
                 f"💡 <i>Type /regime to inspect the real-time statistical market weather.</i>"
             ]
             return "\n".join(lines)
@@ -880,6 +888,17 @@ class TradingDaemon:
             print(f"[Charges Filter] REJECTED {symbol}: Expected ₹{expected_profit:.0f} < {MIN_EDGE_MULTIPLE:g}×Charges ₹{MIN_EDGE_MULTIPLE * est_charges:.0f}")
         return ok
 
+    def filter_disabled_strategies(self, signals: list, label: str) -> list:
+        """Drops signals whose strategy is in DISABLED_STRATEGIES. Applied before any [:N] slice so
+        a disabled signal cannot occupy a slot that an enabled one should get."""
+        enabled = []
+        for s in signals or []:
+            if s.get("strategy") in DISABLED_STRATEGIES:
+                print(f"[Strategy Gate] Skipped {label} {s.get('symbol')}: {s.get('strategy')} is disabled")
+            else:
+                enabled.append(s)
+        return enabled
+
     def run_gap_scan(self):
         """Runs 9:15 AM Gap opening detection across all 181 stocks with Fixed-Risk Sizing."""
         if self.gap_scanned_today:
@@ -889,7 +908,7 @@ class TradingDaemon:
         state = self.load_state()
         risk_metrics = self.calculate_margin_and_risk(state)
 
-        gap_signals = scan_for_gaps()
+        gap_signals = self.filter_disabled_strategies(scan_for_gaps(), "GAP")
         if gap_signals:
             print(f"[Daemon] Found {len(gap_signals)} gap openings!")
             for g in gap_signals[:4]:
@@ -966,6 +985,12 @@ class TradingDaemon:
 
         # 1. Manage open positions
         self.manage_open_positions(state)
+
+        # Equity signals are all labelled DEFAULT_EQUITY_STRATEGY; if it is disabled, skip the 40-stock
+        # scan entirely (open positions were already managed above).
+        if DEFAULT_EQUITY_STRATEGY in DISABLED_STRATEGIES:
+            print(f"[Strategy Gate] Equity {DEFAULT_EQUITY_STRATEGY} scan disabled. Managing open positions only.")
+            return
 
         # 2. Risk & Margin check
         can_trade, reason = self.risk_manager.can_trade()
@@ -1044,7 +1069,7 @@ class TradingDaemon:
                     "target_2": sig.get("target_2", sig["target_price"]),
                     "mode": self.mode,
                     "asset_type": "EQUITY",
-                    "strategy": sig.get("strategy", "INTRADAY"),
+                    "strategy": sig.get("strategy", DEFAULT_EQUITY_STRATEGY),
                     "rl_risk_scaling": rl_act.risk_scaling,
                     "rl_exit_preference": rl_act.exit_preference,
                     "rl_trail_tightness": rl_act.trail_tightness,
@@ -1068,7 +1093,7 @@ class TradingDaemon:
         if len(currency_positions) >= 2:
             return
 
-        currency_signals = scan_all_currency_pairs()
+        currency_signals = self.filter_disabled_strategies(scan_all_currency_pairs(), "FX")
         if currency_signals:
             today_str = datetime.now().strftime("%Y-%m-%d")
             for sig in currency_signals[:2]:
@@ -1147,7 +1172,7 @@ class TradingDaemon:
         if len(commodity_positions) >= 2:
             return
 
-        commodity_signals = scan_all_commodities()
+        commodity_signals = self.filter_disabled_strategies(scan_all_commodities(), "MCX")
         if commodity_signals:
             today_str = datetime.now().strftime("%Y-%m-%d")
             for sig in commodity_signals[:2]:
