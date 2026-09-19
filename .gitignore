@@ -37,3 +37,6 @@ research/src/data/history_cache.json
 # Impulse backtest: downloaded 15m data and generated outputs
 research/intraday_data/
 research/backtest_output/
+
+# Order-flow backtest: downloaded 1-minute NSE data
+research/nse_1min/
