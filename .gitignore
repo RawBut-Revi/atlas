@@ -30,3 +30,5 @@ research/src/panic_state.json
 research/src/drip_portfolio.json
 research/src/drip_ledger.json
 research/src/DRIP_DISABLED
+research/src/drip_ledger_live.json
+research/src/data/profiles_cache.json

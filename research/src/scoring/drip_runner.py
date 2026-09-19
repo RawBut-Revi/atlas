@@ -83,7 +83,8 @@ def run_drip_cycle(broker, ledger: DripLedger, fundamentals: Dict[str, Dict],
                    execute: bool = False, now: Optional[datetime] = None,
                    max_deploy_per_run: float = 50000.0,
                    kill_switch_path: Optional[str] = None,
-                   paper_auto_fund: bool = True) -> Dict:
+                   paper_auto_fund: bool = True,
+                   sector_map: Optional[Dict[str, str]] = None) -> Dict:
     now = now or datetime.now(IST)
     if kill_switch_path and os.path.exists(kill_switch_path):
         return {"status": "DISABLED", "detail": f"kill switch present: {kill_switch_path}"}
@@ -105,7 +106,7 @@ def run_drip_cycle(broker, ledger: DripLedger, fundamentals: Dict[str, Dict],
     scores = score_universe(fundamentals, prices, ttm, trends, score_cfg)
 
     spendable = round(min(ledger.cash_pool, broker.get_funds()), 2)
-    plan = plan_drip(holdings, prices, scores, spendable, cfg)
+    plan = plan_drip(holdings, prices, scores, spendable, cfg, sectors=sector_map)
 
     # Per-run cap: keep best-ranked orders until the cap is reached.
     kept, spent = [], 0.0
@@ -118,7 +119,7 @@ def run_drip_cycle(broker, ledger: DripLedger, fundamentals: Dict[str, Dict],
     plan.cash_spent = round(spent, 2)
     plan.carry = round(spendable - spent, 2)
 
-    report = {"status": "PLANNED", "credits": credits, "ledger_pool": ledger.cash_pool,
+    report = {"status": "PLANNED", "scores": scores, "credits": credits, "ledger_pool": ledger.cash_pool,
               "broker_funds": broker.get_funds(), "spendable": spendable,
               "plan": asdict(plan), "trimmed_by_cap": trimmed, "executed": []}
 
@@ -136,7 +137,7 @@ def run_drip_cycle(broker, ledger: DripLedger, fundamentals: Dict[str, Dict],
     for o in plan.orders:
         res = broker.place_order(o.symbol, o.qty, o.limit_price, prices[o.symbol])
         report["executed"].append(res)
-        if res["status"] == "FILLED":
+        if res["status"] in ("FILLED", "PENDING"):          # PENDING keeps its cash reserved: no double-spend
             ledger.debit(res["cash_used"])
             ledger.record_order({**res, "time": now.isoformat(), "efficiency": o.efficiency})
     ledger.save()

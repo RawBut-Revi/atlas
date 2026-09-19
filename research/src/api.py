@@ -24,6 +24,7 @@ from trading.strategy import generate_signal
 from trading.backtest import fetch_historical_data, UPSTOX_WATCHLIST
 from trading.universe import NSE_UNIVERSE
 from trading.risk import RiskManager
+from scoring.drip_service import DripService, DripError
 
 app = FastAPI(title="Project Atlas API")
 
@@ -37,6 +38,7 @@ app.add_middleware(
 
 advisor = None
 risk_manager = RiskManager(capital=10000.0)
+drip = DripService()
 
 # In-memory store for paper/live trades and positions
 POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_positions.json")
@@ -93,6 +95,18 @@ class OrderRequest(BaseModel):
 class ClosePositionRequest(BaseModel):
     position_id: str
     exit_price: float
+
+class DripRunRequest(BaseModel):
+    mode: str = "paper"                    # "paper" or "live"
+    confirm: bool = False                  # required for live orders
+    max_deploy: float = 50000.0
+    tracking_start: Optional[str] = None   # YYYY-MM-DD: ignore dividends before this ex-date
+
+class DripInitRequest(BaseModel):
+    holdings: dict                         # {"ITC": 1000, "ONGC": 500}
+
+class DripKillRequest(BaseModel):
+    enabled: bool
 
 
 # ─── Health & AI Chat Endpoints ─────────────────────────────────
@@ -268,6 +282,50 @@ def close_position(req: ClosePositionRequest):
     save_positions(pos_data)
     
     return {"status": "SUCCESS", "closed_trade": closed_record, "total_pnl": pos_data["total_pnl"]}
+
+
+# ─── Dividend Reinvestment (DRIP) ────────────────────────────────
+
+def _drip_call(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except DripError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DRIP failure: {type(e).__name__}: {e}")
+
+
+@app.get("/api/drip/status")
+def drip_status():
+    """Paper portfolio, dividend ledger, kill-switch and live-enabled flags."""
+    return _drip_call(drip.status)
+
+
+@app.post("/api/drip/plan")
+def drip_plan(req: DripRunRequest):
+    """Dry run: ranking + the orders Atlas WOULD place. Writes nothing."""
+    return _drip_call(drip.cycle, execute=False, mode=req.mode, max_deploy=req.max_deploy,
+                      tracking_start=req.tracking_start)
+
+
+@app.post("/api/drip/execute")
+def drip_execute(req: DripRunRequest):
+    """Runs a cycle and places orders. Live mode also needs confirm=true and ATLAS_LIVE_DRIP=1."""
+    return _drip_call(drip.cycle, execute=True, mode=req.mode, confirm=req.confirm,
+                      max_deploy=req.max_deploy, tracking_start=req.tracking_start)
+
+
+@app.post("/api/drip/kill")
+def drip_kill(req: DripKillRequest):
+    _drip_call(drip.set_kill_switch, req.enabled)
+    return {"killed": drip.killed}
+
+
+@app.post("/api/drip/portfolio")
+def drip_init_portfolio(req: DripInitRequest):
+    """Creates the paper portfolio (refuses to overwrite an existing one)."""
+    _drip_call(drip.init_paper_portfolio, req.holdings)
+    return _drip_call(drip.status)
 
 
 if __name__ == "__main__":

@@ -61,7 +61,7 @@ def _round_tick(price: float) -> float:
 
 def plan_drip(holdings: Dict[str, int], prices: Dict[str, float], scores: Dict[str, Dict],
               cash: float, cfg: PlannerConfig = PlannerConfig(),
-              blocked: frozenset = frozenset()) -> DripPlan:
+              blocked: frozenset = frozenset(), sectors: Dict[str, str] = None) -> DripPlan:
     plan = DripPlan(cash_in=max(cash, 0.0), carry=max(cash, 0.0))
     if cash <= 0:
         return plan
@@ -69,7 +69,7 @@ def plan_drip(holdings: Dict[str, int], prices: Dict[str, float], scores: Dict[s
     held_value = {s: q * prices.get(s, 0.0) for s, q in holdings.items() if q > 0}
     sector_value: Dict[str, float] = {}
     for s, v in held_value.items():
-        sec = scores.get(s, {}).get("sector", "UNKNOWN")
+        sec = scores.get(s, {}).get("sector") or (sectors or {}).get(s) or "UNKNOWN"
         sector_value[sec] = sector_value.get(sec, 0.0) + v
     base = sum(held_value.values()) + cash
     plan.base_value = base
