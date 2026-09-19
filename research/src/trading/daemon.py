@@ -62,6 +62,10 @@ DISABLED_STRATEGIES = frozenset({"INTRADAY", "US_SESSION_MOMENTUM", "GAP_FADE"})
 # generate_signal() emits no "strategy" key; equity entries are labelled with this default.
 DEFAULT_EQUITY_STRATEGY = "INTRADAY"
 
+# Churn guards: costs (~₹250-300/round-trip) outweighed edge in every backtest and in the live RCA.
+MAX_DAILY_TRADES = 8
+MAX_TRADES_PER_SYMBOL_PER_DAY = 3
+
 
 class TradingDaemon:
     def __init__(self, scan_interval_seconds: int = 180, mode: str = "PAPER"):
@@ -608,7 +612,7 @@ class TradingDaemon:
                 f"🎯 <b>Active Algorithmic Rules:</b>",
                 f"  • Rejects all setups during <code>CHOP_CONSOLIDATION</code> (P(Chop) ≥ 65%)",
                 f"  • Multiplier Cap: Hard-rejects oversized contracts (e.g. Copper Standard)",
-                f"  • Max Daily Entries: Capped at 3 trades per symbol per day",
+                f"  • Max Daily Entries: {MAX_DAILY_TRADES} trades total, {MAX_TRADES_PER_SYMBOL_PER_DAY} per symbol per day",
                 f"  • Disabled Strategies: <code>{', '.join(sorted(DISABLED_STRATEGIES))}</code>\n",
                 f"💡 <i>Type /regime to inspect the real-time statistical market weather.</i>"
             ]
@@ -888,6 +892,22 @@ class TradingDaemon:
             print(f"[Charges Filter] REJECTED {symbol}: Expected ₹{expected_profit:.0f} < {MIN_EDGE_MULTIPLE:g}×Charges ₹{MIN_EDGE_MULTIPLE * est_charges:.0f}")
         return ok
 
+    def passes_daily_caps(self, state: dict, symbol: str) -> bool:
+        """Blocks new entries once today's trades (closed + still open) hit the global or per-symbol cap."""
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        todays = [
+            t for t in list(state.get("trade_history", [])) + list(state.get("open_positions", []))
+            if str(t.get("entry_time", "")).startswith(today_str)
+        ]
+        if len(todays) >= MAX_DAILY_TRADES:
+            print(f"[Daily Cap] REJECTED {symbol}: {len(todays)}/{MAX_DAILY_TRADES} trades already taken today")
+            return False
+        symbol_count = sum(1 for t in todays if t.get("symbol") == symbol)
+        if symbol_count >= MAX_TRADES_PER_SYMBOL_PER_DAY:
+            print(f"[Daily Cap] REJECTED {symbol}: {symbol_count}/{MAX_TRADES_PER_SYMBOL_PER_DAY} trades in this symbol today")
+            return False
+        return True
+
     def filter_disabled_strategies(self, signals: list, label: str) -> list:
         """Drops signals whose strategy is in DISABLED_STRATEGIES. Applied before any [:N] slice so
         a disabled signal cannot occupy a slot that an enabled one should get."""
@@ -916,6 +936,8 @@ class TradingDaemon:
                     continue
                 if len(state.get("open_positions", [])) >= 8:
                     break
+                if not self.passes_daily_caps(state, g["symbol"]):
+                    continue
 
                 # ─── RL Execution Optimizer ───
                 rl_state = self.rl_optimizer.build_state_from_market(
@@ -1017,6 +1039,9 @@ class TradingDaemon:
                 if any(p["symbol"] == sig["symbol"] for p in state.get("open_positions", [])):
                     continue
 
+                if not self.passes_daily_caps(state, sig["symbol"]):
+                    continue
+
                 # ─── Macro-to-Micro Alignment: Check Multi-Week Swing Bias ───
                 macro_bias = get_swing_directional_bias(sig["symbol"])
                 if macro_bias == "ONLY_BUY_DIPS" and sig["direction"] == "SELL":
@@ -1103,6 +1128,8 @@ class TradingDaemon:
                 past_today = [t for t in state.get("trade_history", []) if t.get("symbol") == sig["symbol"] and t.get("entry_time", "").startswith(today_str)]
                 if len(past_today) >= 3:
                     continue
+                if not self.passes_daily_caps(state, sig["symbol"]):
+                    continue
 
                 # ─── RL Execution Optimizer ───
                 rl_state = self.rl_optimizer.build_state_from_market(
@@ -1181,6 +1208,8 @@ class TradingDaemon:
 
                 past_today = [t for t in state.get("trade_history", []) if t.get("symbol") == sig["symbol"] and t.get("entry_time", "").startswith(today_str)]
                 if len(past_today) >= 3:
+                    continue
+                if not self.passes_daily_caps(state, sig["symbol"]):
                     continue
 
                 spec = COMMODITY_SPECS.get(sig["symbol"])
