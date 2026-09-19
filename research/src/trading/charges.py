@@ -211,6 +211,33 @@ def passes_charges_filter(
     return ok, est.gross_pnl, est.total_charges
 
 
+def calculate_delivery_buy_charges(
+    price: float,
+    qty: int,
+    broker_flat_fee: float = 20.0,
+    brokerage_cap_pct: float = 0.025,
+) -> dict:
+    """
+    Charges for one NSE equity DELIVERY buy order (the only leg a dividend reinvestment pays).
+    The DP charge applies to sells only, so it is not included.
+
+    STT (0.1%) and stamp duty (0.015%) are statutory. The brokerage schedule (flat fee or
+    a percentage cap, whichever is lower) is broker-specific: verify it against your
+    Upstox plan. The exchange rate matches the intraday model above.
+    Returns {"total", "value", "brokerage", "stt", "exchange", "stamp", "sebi", "gst"}.
+    """
+    value = price * qty
+    brokerage = min(broker_flat_fee, value * brokerage_cap_pct) if qty > 0 else 0.0
+    stt = value * 0.001
+    exchange = value * 0.0000345
+    stamp = value * 0.00015
+    sebi = value * 0.000001
+    gst = (brokerage + exchange + sebi) * 0.18
+    total = brokerage + stt + exchange + stamp + sebi + gst
+    return {"total": total, "value": value, "brokerage": brokerage, "stt": stt,
+            "exchange": exchange, "stamp": stamp, "sebi": sebi, "gst": gst}
+
+
 if __name__ == "__main__":
     print("=== Testing Real-World Transaction Charges Engine ===")
     

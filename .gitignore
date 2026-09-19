@@ -25,3 +25,8 @@ research/src/swing_watchlist.json
 research/src/trading/authorized_users.json
 research/src/news_cache.json
 research/src/panic_state.json
+
+# DRIP runtime state (holdings, dividend ledger, kill switch)
+research/src/drip_portfolio.json
+research/src/drip_ledger.json
+research/src/DRIP_DISABLED
