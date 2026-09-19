@@ -12,7 +12,7 @@
     ],
     "deny": [
       "Bash(rm -rf /)",
-      "Bash(del /s /q c:\\)"
+      "Bash(del /s /q c:\\\\)"
     ]
   }
 }
