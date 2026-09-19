@@ -32,3 +32,4 @@ research/src/drip_ledger.json
 research/src/DRIP_DISABLED
 research/src/drip_ledger_live.json
 research/src/data/profiles_cache.json
+research/src/data/history_cache.json
