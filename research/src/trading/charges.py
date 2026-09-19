@@ -47,6 +47,26 @@ class TradeCharges:
         }
 
 
+def contract_multiplier(symbol: str, asset_type: str) -> float:
+    """Units per lot used for turnover and P&L. Single source of truth for charges and displayed stats."""
+    asset_type = asset_type.upper()
+    if asset_type == "CURRENCY":
+        # USDINR / EURINR / GBPINR = 1000, JPYINR = 100,000
+        return 100000.0 if "JPY" in symbol else 1000.0
+    if asset_type == "COMMODITY":
+        if "CRUDE" in symbol:
+            return 10.0        # 10 barrels per mini lot
+        if "NATGAS" in symbol or "GAS" in symbol:
+            return 250.0       # 250 mmBtu per mini lot
+        if "SILVER" in symbol:
+            return 1.0         # 1 kg per micro lot
+        if "GOLD" in symbol:
+            return 100.0       # 100 grams
+        if "COPPER" in symbol:
+            return 250.0       # 250 kg per mini lot (COPPERM)
+    return 1.0
+
+
 def calculate_trade_charges(
     symbol: str,
     asset_type: str,          # "EQUITY", "CURRENCY", "COMMODITY"
@@ -62,22 +82,7 @@ def calculate_trade_charges(
     asset_type = asset_type.upper()
     direction = direction.upper()
 
-    # Determine contract multiplier for turnover
-    multiplier = 1.0
-    if asset_type == "CURRENCY":
-        # USDINR / EURINR / GBPINR = 1000, JPYINR = 100,000
-        multiplier = 100000.0 if "JPY" in symbol else 1000.0
-    elif asset_type == "COMMODITY":
-        if "CRUDE" in symbol:
-            multiplier = 10.0      # 10 barrels per mini lot
-        elif "NATGAS" in symbol or "GAS" in symbol:
-            multiplier = 250.0     # 250 mmBtu per mini lot
-        elif "SILVER" in symbol:
-            multiplier = 1.0       # 1 kg per micro lot
-        elif "GOLD" in symbol:
-            multiplier = 100.0     # 100 grams
-        elif "COPPER" in symbol:
-            multiplier = 250.0     # 250 kg per mini lot (COPPERM)
+    multiplier = contract_multiplier(symbol, asset_type)
 
     units = qty_or_lots * multiplier
 

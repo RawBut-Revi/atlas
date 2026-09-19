@@ -35,7 +35,8 @@ from trading.commodity_strategy import (
     MCX_OPEN, MCX_US_SESSION_OPEN, MCX_CLOSE, MCX_SQUARE_OFF,
 )
 from trading.patterns import analyze_3hour_patterns
-from trading.charges import calculate_trade_charges, passes_charges_filter, MIN_EDGE_MULTIPLE
+from trading.charges import calculate_trade_charges, passes_charges_filter, contract_multiplier, MIN_EDGE_MULTIPLE
+from trading import pnl_stats
 from trading.swing_radar import scan_swing_radar, get_swing_directional_bias, SwingObservation
 from trading.neural_markov import evaluate_trade_conviction, get_current_regime_status, RegimeState
 from trading.rl_optimizer import RLExecutionOptimizer, RLState, RLAction
@@ -147,26 +148,13 @@ class TradingDaemon:
             if asset_type == "CURRENCY":
                 spec = CURRENCY_PAIRS.get(symbol)
                 pos_margin = qty * (spec.approx_margin if spec else 2000.0)
-                multiplier = 100000.0 if "JPY" in symbol else 1000.0
             elif asset_type == "COMMODITY":
                 spec = COMMODITY_SPECS.get(symbol)
                 pos_margin = qty * (spec.approx_margin if spec else 15000.0)
-                if "CRUDE" in symbol:
-                    multiplier = 10.0
-                elif "NATGAS" in symbol:
-                    multiplier = 250.0
-                elif "SILVER" in symbol:
-                    multiplier = 1.0
-                elif "GOLD" in symbol:
-                    multiplier = 100.0
-                elif "COPPER" in symbol:
-                    multiplier = 2500.0
-                else:
-                    multiplier = 1.0
             else:  # EQUITY (5x intraday MIS leverage)
                 pos_margin = (p.get("entry_price", 0.0) * qty) / 5.0
-                multiplier = 1.0
 
+            multiplier = contract_multiplier(symbol, asset_type)
             used_margin += pos_margin
 
             # 2. Scenario Risk Exposure
@@ -193,6 +181,22 @@ class TradingDaemon:
             "open_count": len(open_pos),
         }
 
+    def build_daily_summary(self, state: dict) -> dict:
+        """Today's closed-trade figures for the EOD report, from trade_history (the single source of truth)."""
+        closed = pnl_stats.closed_on(state.get("trade_history", []), datetime.now().strftime("%Y-%m-%d"))
+        s = pnl_stats.summarize(closed)
+        return {
+            "total_trades": s["trades"],
+            "wins": s["wins"],
+            "losses": s["losses"],
+            "win_rate": s["win_rate"],
+            "total_gross_pnl": s["gross"],
+            "total_charges_paid": s["charges"],
+            "total_net_pnl": s["net"],
+            "by_asset": pnl_stats.by_asset(closed),
+            "closing_capital": state.get("capital", 0.0) + state.get("total_pnl", 0.0),
+        }
+
     # ─── 2. Telegram Command Handler (Instant Response) ───────────
 
     def handle_telegram_command(self, cmd: str, sender_id: str = "") -> str:
@@ -203,6 +207,10 @@ class TradingDaemon:
 
         if cmd == "/status":
             now_ist = datetime.now(IST).strftime("%H:%M:%S IST")
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            today = pnl_stats.summarize(pnl_stats.closed_on(state.get("trade_history", []), today_str))
+            sl_loss = risk_metrics["total_max_sl_loss"]
+            rr_line = f"1 : {risk_metrics['total_max_tp_gain'] / sl_loss:.2f}" if sl_loss > 0 else "n/a (no open trades)"
             return (
                 f"🤖 <b>ATLAS MULTI-ASSET PORTFOLIO STATUS</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
@@ -215,10 +223,14 @@ class TradingDaemon:
                 f"🛡️ <b>SCENARIO RISK EXPOSURE:</b>\n"
                 f"  🛑 <b>Worst Case (All SLs Hit):</b> -₹{risk_metrics['total_max_sl_loss']:,.2f} (-{risk_metrics['max_loss_pct']:.1f}% Risk)\n"
                 f"  🎯 <b>Best Case (All TPs Hit):</b> +₹{risk_metrics['total_max_tp_gain']:,.2f} (+{risk_metrics['max_gain_pct']:.1f}% Gain)\n"
-                f"  ⚖️ <b>Risk : Reward:</b> 1 : 1.50\n\n"
-                f"📈 <b>TODAY'S PERFORMANCE:</b>\n"
-                f"  💵 <b>Realized Net P&L:</b> ₹{state.get('total_pnl', 0.0):+.2f}\n"
-                f"  📊 <b>Markets:</b> 181 Equities + 4 FX + 5 MCX"
+                f"  ⚖️ <b>Risk : Reward (open trades):</b> {rr_line}\n\n"
+                f"📈 <b>TODAY'S PERFORMANCE (closed, after charges):</b>\n"
+                f"  🔢 <b>Trades:</b> {today['trades']} ({today['wins']}W / {today['losses']}L"
+                f"{' / ' + str(today['breakevens']) + ' flat' if today['breakevens'] else ''})"
+                f" | 🎯 WR {today['win_rate']}%\n"
+                f"  💵 <b>Net P&L:</b> {pnl_stats.money(today['net'])} (fees -₹{today['charges']:,.2f})\n"
+                f"  📊 <b>Cumulative Net P&L:</b> {pnl_stats.money(state.get('total_pnl', 0.0))}\n"
+                f"  🔔 <b>Alerts:</b> {self.notifier.alert_mode} (change with /alerts)"
             )
 
         elif cmd in ("/positions", "/pos"):
@@ -231,20 +243,23 @@ class TradingDaemon:
                 f"🔒 Used: ₹{risk_metrics['used_margin']:,.0f} | 🟢 Free: ₹{risk_metrics['free_margin']:,.0f}",
                 f"━━━━━━━━━━━━━━━━━━━"
             ]
+            total_unrealized = 0.0
             for p in open_pos:
                 asset_type = p.get("asset_type", "EQUITY")
                 cur_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
-                
-                # Calculate live unrealized P&L
+
+                # Live unrealized P&L (gross, before charges). Units = lots x contract multiplier.
                 qty = p.get("lots", p.get("qty", 1))
+                units = qty * contract_multiplier(p["symbol"], asset_type)
                 if p["direction"] == "BUY":
-                    unrealized_pnl = (cur_price - p["entry_price"]) * qty
+                    unrealized_pnl = (cur_price - p["entry_price"]) * units
                     unrealized_pct = ((cur_price - p["entry_price"]) / max(p["entry_price"], 0.001)) * 100.0
                 else:
-                    unrealized_pnl = (p["entry_price"] - cur_price) * qty
+                    unrealized_pnl = (p["entry_price"] - cur_price) * units
                     unrealized_pct = ((p["entry_price"] - cur_price) / max(p["entry_price"], 0.001)) * 100.0
+                total_unrealized += unrealized_pnl
 
-                pnl_badge = f"🟢 +₹{unrealized_pnl:.2f} (+{unrealized_pct:.2f}%)" if unrealized_pnl >= 0 else f"🔴 -₹{abs(unrealized_pnl):.2f} ({unrealized_pct:.2f}%)"
+                pnl_badge = f"🟢 {pnl_stats.money(unrealized_pnl)} ({unrealized_pct:+.2f}%)" if unrealized_pnl >= 0 else f"🔴 {pnl_stats.money(unrealized_pnl)} ({unrealized_pct:+.2f}%)"
 
                 if asset_type == "COMMODITY":
                     tag = "🛢️"
@@ -257,8 +272,8 @@ class TradingDaemon:
                     qty_label = f"Qty: {p.get('qty', 10)}"
 
                 # Position risk scenario
-                sl_risk = abs(p["entry_price"] - p["stop_loss"]) * qty
-                tp_reward = abs(p["target_price"] - p["entry_price"]) * qty
+                sl_risk = abs(p["entry_price"] - p["stop_loss"]) * units
+                tp_reward = abs(p["target_price"] - p["entry_price"]) * units
 
                 lines.append(
                     f"{tag} <b>{p['symbol']}</b> ({p['direction']}) | {qty_label}\n"
@@ -269,6 +284,7 @@ class TradingDaemon:
                 )
 
             lines.append(
+                f"💵 <b>Total Unrealized P&L (before charges):</b> {pnl_stats.money(total_unrealized)}\n"
                 f"🛡️ <b>Total Worst-Case Loss:</b> -₹{risk_metrics['total_max_sl_loss']:,.2f}\n"
                 f"🎯 <b>Total Best-Case Gain:</b> +₹{risk_metrics['total_max_tp_gain']:,.2f}"
             )
@@ -277,41 +293,36 @@ class TradingDaemon:
         elif cmd in ("/pnl", "/summary"):
             history = state.get("trade_history", [])
             today_str = datetime.now().strftime("%Y-%m-%d")
-            closed_today = [t for t in history if t.get("exit_time", "").startswith(today_str)]
-            
-            gross_pnl = sum(t.get("gross_pnl", t.get("pnl", 0.0)) for t in closed_today)
-            total_fees = sum(t.get("charges", 0.0) for t in closed_today)
-            net_pnl = sum(t.get("net_pnl", t.get("pnl", 0.0)) for t in closed_today)
-
-            wins = len([t for t in closed_today if t.get("net_pnl", t.get("pnl", 0)) > 0])
-            losses = len([t for t in closed_today if t.get("net_pnl", t.get("pnl", 0)) < 0])
-            breakevens = len([t for t in closed_today if abs(t.get("net_pnl", t.get("pnl", 0))) < 0.01])
-            total_trades = len(closed_today)
-            wr = round(wins / max(total_trades - breakevens, 1) * 100, 1) if (total_trades - breakevens) > 0 else 0.0
+            closed_today = pnl_stats.closed_on(history, today_str)
+            s = pnl_stats.summarize(closed_today)
+            all_time = pnl_stats.summarize(history)
+            flat = f" ⚪ {s['breakevens']}" if s["breakevens"] else ""
 
             lines = [
-                f"📈 <b>TODAY'S REAL-WORLD P&L ({today_str})</b>",
+                f"📈 <b>TODAY'S P&L ({today_str})</b>",
                 f"━━━━━━━━━━━━━━━━━━━",
-                f"🔢 <b>Total Trades:</b> {total_trades}",
-                f"✅ Wins: {wins} | ❌ Losses: {losses} | ⚪ Breakeven: {breakevens}",
-                f"🎯 <b>Win Rate:</b> {wr}%\n",
-                f"💰 <b>Today's Gross P&L:</b> <code>₹{gross_pnl:+.2f}</code>",
-                f"🧾 <b>Brokerage & Taxes:</b> <code>-₹{total_fees:.2f}</code>",
-                f"💵 <b>Today's Net P&L:</b> <b>₹{net_pnl:+.2f}</b>",
-                f"📊 <b>Cumulative Net P&L:</b> <b>₹{state.get('total_pnl', 0.0):+.2f}</b>",
-                f"💼 <b>Current Demat Balance:</b> <b>₹{risk_metrics['total_capital']:,.2f}</b>\n",
+                f"💵 <b>Net: {pnl_stats.money(s['net'])}</b>",
+                f"   Gross {pnl_stats.money(s['gross'])} − Fees ₹{s['charges']:,.2f}",
+                f"🔢 {s['trades']} closed: ✅ {s['wins']} ❌ {s['losses']}{flat} | 🎯 WR {s['win_rate']}%",
             ]
+            if closed_today:
+                lines.append(f"🏆 Best {pnl_stats.money(s['best'])} | 💥 Worst {pnl_stats.money(s['worst'])}")
+                lines.append("\n📂 <b>By market:</b>")
+                lines.extend(pnl_stats.asset_rows(pnl_stats.by_asset(closed_today)))
+            else:
+                lines.append("ℹ️ No trades closed yet today.")
+
+            lines.append(
+                f"\n📊 <b>Cumulative:</b> {pnl_stats.money(state.get('total_pnl', 0.0))} "
+                f"({all_time['trades']} trades, WR {all_time['win_rate']}%)\n"
+                f"💼 <b>Balance:</b> ₹{risk_metrics['total_capital']:,.2f} | ⚡ {risk_metrics['open_count']} open (see /positions)"
+            )
 
             if closed_today:
-                lines.append("📋 <b>TRADE FEE BREAKDOWN:</b>")
-                for t in closed_today[:8]:
-                    t_net = t.get("net_pnl", t.get("pnl", 0.0))
-                    t_gross = t.get("gross_pnl", t_net)
-                    t_fee = t.get("charges", 0.0)
-                    t_icon = "🟢" if t_net > 0 else ("🔴" if t_net < 0 else "⚪")
-                    lines.append(
-                        f"{t_icon} <b>{t.get('symbol')}</b> ({t.get('direction')}): Gross ₹{t_gross:+.2f} | Fees -₹{t_fee:.2f} ➔ Net <b>₹{t_net:+.2f}</b>"
-                    )
+                lines.append("\n📋 <b>Latest closed today:</b>")
+                lines.extend(pnl_stats.trade_line(t) for t in closed_today[:8])
+                if len(closed_today) > 8:
+                    lines.append(f"…and {len(closed_today) - 8} more (use /report)")
 
             return "\n".join(lines)
 
@@ -320,19 +331,36 @@ class TradingDaemon:
             if not history:
                 return "ℹ️ No trade history recorded yet."
 
-            lines = ["📜 <b>HISTORICAL TRADE JOURNAL (REAL-WORLD)</b>\n━━━━━━━━━━━━━━━━━━━"]
-            for i, t in enumerate(history[:12], 1):
-                t_net = t.get("net_pnl", t.get("pnl", 0.0))
-                t_gross = t.get("gross_pnl", t_net)
-                t_fee = t.get("charges", 0.0)
-                t_icon = "🟢" if t_net > 0 else ("🔴" if t_net < 0 else "⚪")
-                lines.append(
-                    f"{i}. {t_icon} <b>{t.get('symbol')}</b> ({t.get('direction')}) | Net P&L: <b>₹{t_net:+.2f}</b>\n"
-                    f"   Gross: ₹{t_gross:+.2f} | Taxes/Fees: -₹{t_fee:.2f} | {t.get('status')}\n"
-                    f"   Entry: ₹{t.get('entry_price')} ➔ Exit: ₹{t.get('exit_price')}\n"
-                    f"   Time: {t.get('entry_time', '')} ➔ {t.get('exit_time', '')}\n"
-                )
+            s = pnl_stats.summarize(history)
+            lines = [
+                "📜 <b>TRADE JOURNAL — ALL TIME</b>",
+                "━━━━━━━━━━━━━━━━━━━",
+                f"💵 <b>Net: {pnl_stats.money(s['net'])}</b> (Gross {pnl_stats.money(s['gross'])} − Fees ₹{s['charges']:,.2f})",
+                f"🔢 {s['trades']} trades: ✅ {s['wins']} ❌ {s['losses']} | 🎯 WR {s['win_rate']}%",
+                "\n📂 <b>By market:</b>",
+            ]
+            lines.extend(pnl_stats.asset_rows(pnl_stats.by_asset(history)))
+            lines.append("\n🧠 <b>By strategy:</b>")
+            lines.extend(pnl_stats.strategy_rows(pnl_stats.by_strategy(history)))
+            lines.append("\n📋 <b>Latest 10 trades:</b>")
+            lines.extend(pnl_stats.trade_line(t) for t in history[:10])
             return "\n".join(lines)
+
+        elif cmd in ("/alerts", "/quiet", "/mute", "/loud") or cmd.startswith("/alerts "):
+            aliases = {"/quiet": "quiet", "/mute": "mute", "/loud": "normal"}
+            mode = aliases.get(cmd) or (cmd.split(maxsplit=1)[1] if " " in cmd else None)
+            if mode == "loud":
+                mode = "normal"
+            if mode is None:
+                return (f"🔔 <b>Alert mode:</b> {self.notifier.alert_mode}\n"
+                        f"/quiet — trade &amp; EOD alerts arrive silently (no sound)\n"
+                        f"/mute — no automatic alerts (commands still answer)\n"
+                        f"/loud — all alerts with sound")
+            if not self.notifier.set_alert_mode(mode):
+                return "❌ Unknown mode. Use /quiet, /mute or /loud."
+            desc = {"normal": "all alerts with sound", "quiet": "trade & EOD alerts silent, setup alerts off",
+                    "mute": "no automatic alerts"}[self.notifier.alert_mode]
+            return f"🔔 Alerts set to <b>{self.notifier.alert_mode}</b>: {desc}."
 
         elif cmd == "/scan":
             threading.Thread(target=self.run_scan_cycle, daemon=True).start()
@@ -680,9 +708,10 @@ class TradingDaemon:
                 f"🤖 <b>ATLAS BOT COMMANDS</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━\n"
                 f"⚡ /positions — Live open trades & unrealized P&L\n"
-                f"📊 /status — Demat capital, used margin & scenario risk\n"
-                f"💰 /pnl — Today's closed trades & realized profit\n"
-                f"📜 /report — Full historical trade audit journal\n"
+                f"📊 /status — Capital, margin, risk & today's summary\n"
+                f"💰 /pnl — Today's P&L by market + latest trades\n"
+                f"📜 /report — All-time journal by market & strategy\n"
+                f"🔔 /quiet /mute /loud — Alert mode (silent / none / sound)\n"
                 f"🔭 /swing — Multi-Week Swing Observation Radar (1-4w)\n"
                 f"📊 /fno — Options & Futures swing trade simulations\n"
                 f"🚀 /penny — Multibagger Penny Stock Radar (Growth & Turnarounds)\n"
@@ -699,7 +728,7 @@ class TradingDaemon:
                 f"➕ /adduser &lt;id&gt; — Authorize new trading friend"
             )
 
-        return "Commands: /status, /positions, /pnl, /report, /swing, /fno, /penny, /volatility, /patterns, /scan, /gaps, /currency, /commodities, /regime, /ai, /rl, /users, /help"
+        return "Commands: /status, /positions, /pnl, /report, /alerts, /swing, /fno, /penny, /volatility, /patterns, /scan, /gaps, /currency, /commodities, /regime, /ai, /rl, /users, /help"
 
     # ─── 3. High-Speed Intraday Scanning (5-8 Seconds) ────────────
 

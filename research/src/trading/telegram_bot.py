@@ -11,7 +11,15 @@ import time
 from datetime import datetime
 from typing import Callable, Optional, List
 
+from trading.pnl_stats import trades_label
+
 USERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "authorized_users.json")
+ALERT_MODE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_mode.json")
+
+# normal: every alert with sound. quiet: trade/EOD alerts delivered silently, setup alerts dropped
+# (they duplicate the trade-executed alert). mute: no automatic alerts; command replies still work.
+ALERT_MODES = ("normal", "quiet", "mute")
+DEFAULT_ALERT_MODE = "quiet"
 
 
 def _load_env_file():
@@ -51,6 +59,36 @@ class TelegramNotifier:
         self.chat_ids: list[str] = self._load_authorized_users(chat_id)
         self.last_update_id = 0
         self.is_enabled = bool(self.token and len(self.chat_ids) > 0)
+        self.alert_mode = self._load_alert_mode()
+
+    def _load_alert_mode(self) -> str:
+        try:
+            with open(ALERT_MODE_FILE, "r", encoding="utf-8") as f:
+                mode = json.load(f).get("mode")
+            if mode in ALERT_MODES:
+                return mode
+        except Exception:
+            pass
+        return DEFAULT_ALERT_MODE
+
+    def set_alert_mode(self, mode: str) -> bool:
+        """Sets and persists the automatic-alert mode. Returns False for an unknown mode."""
+        mode = str(mode).strip().lower()
+        if mode not in ALERT_MODES:
+            return False
+        self.alert_mode = mode
+        try:
+            with open(ALERT_MODE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"mode": mode}, f)
+        except Exception:
+            pass
+        return True
+
+    def _send_alert(self, text: str):
+        """Automatic (unsolicited) alert, honouring the alert mode. Replies to commands use send_message."""
+        if self.alert_mode == "mute":
+            return
+        self.send_message(text, silent=(self.alert_mode == "quiet"))
 
     def _load_authorized_users(self, override_chat_id: Optional[str] = None) -> list[str]:
         """Loads whitelist from JSON file and .env."""
@@ -111,11 +149,13 @@ class TelegramNotifier:
             return True
         return False
 
-    def send_message(self, text: str, parse_mode: str = "HTML", target_chat_id: Optional[str] = None) -> bool:
+    def send_message(self, text: str, parse_mode: str = "HTML", target_chat_id: Optional[str] = None,
+                     silent: bool = False) -> bool:
         """
         Sends a message to Telegram.
         If target_chat_id is specified, sends only to that user.
         If target_chat_id is None, broadcasts to ALL authorized users.
+        silent=True delivers without sound or vibration (Telegram disable_notification).
         """
         if not self.token:
             return False
@@ -135,6 +175,7 @@ class TelegramNotifier:
                 "text": text,
                 "parse_mode": parse_mode,
                 "disable_web_page_preview": True,
+                "disable_notification": silent,
             }
             try:
                 resp = requests.post(url, json=payload, timeout=6)
@@ -147,7 +188,9 @@ class TelegramNotifier:
         return success
 
     def notify_signal_found(self, sig: dict):
-        """Broadcast trade opportunity alert to all authorized users."""
+        """Broadcast trade opportunity alert (normal mode only: the trade-executed alert covers quiet mode)."""
+        if self.alert_mode != "normal":
+            return
         icon = "🟢 <b>BUY SETUP FOUND</b>" if sig.get("direction") == "BUY" else "🔴 <b>SELL SETUP FOUND</b>"
         timeframe_tag = f"[{sig.get('timeframe', '3H')}]" if 'timeframe' in sig else ""
         pattern_line = f"🕯️ <b>3H Pattern:</b> {sig.get('pattern_3h')}\n" if sig.get("pattern_3h") else ""
@@ -165,7 +208,7 @@ class TelegramNotifier:
             f"💡 <i>{sig.get('rationale', '')}</i>\n"
             f"⏰ <i>{datetime.now().strftime('%H:%M:%S IST')}</i>"
         )
-        self.send_message(msg)
+        self._send_alert(msg)
 
     def notify_trade_executed(self, trade: dict):
         """Broadcast trade execution alert to all authorized users."""
@@ -180,7 +223,7 @@ class TelegramNotifier:
             f"🎯 Target: ₹{trade.get('target_price')} | 🛑 SL: ₹{trade.get('stop_loss')}\n"
             f"⏰ Time: {trade.get('entry_time', datetime.now().strftime('%H:%M:%S'))}"
         )
-        self.send_message(msg)
+        self._send_alert(msg)
 
     def notify_trade_closed(self, trade: dict):
         """Broadcast trade exit & P&L alert with real-world tax breakdown."""
@@ -213,17 +256,25 @@ class TelegramNotifier:
             f"💵 <b>Net Take-Home:</b> <code>{net_str}</code>\n"
             f"⏰ Exit Time: {trade.get('exit_time')}"
         )
-        self.send_message(msg)
+        self._send_alert(msg)
 
     def notify_daily_summary(self, summary: dict):
-        """Broadcast end of day summary report with gross & net P&L."""
+        """Broadcast end of day summary. Expects today's figures (see TradingDaemon.build_daily_summary)."""
         net_pnl = summary.get("total_net_pnl", summary.get("total_pnl", 0.0))
         gross_pnl = summary.get("total_gross_pnl", net_pnl)
         total_charges = summary.get("total_charges_paid", 0.0)
+        closing_capital = summary.get("closing_capital", summary.get("capital", 0.0) + net_pnl)
 
         pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
-        net_str = f"+₹{net_pnl:.2f}" if net_pnl >= 0 else f"-₹{abs(net_pnl):.2f}"
-        gross_str = f"+₹{gross_pnl:.2f}" if gross_pnl >= 0 else f"-₹{abs(gross_pnl):.2f}"
+        net_str = f"+₹{net_pnl:,.2f}" if net_pnl >= 0 else f"-₹{abs(net_pnl):,.2f}"
+        gross_str = f"+₹{gross_pnl:,.2f}" if gross_pnl >= 0 else f"-₹{abs(gross_pnl):,.2f}"
+
+        asset_lines = ""
+        for asset, s in (summary.get("by_asset") or {}).items():
+            sign = "+" if s["net"] >= 0 else "-"
+            asset_lines += f"  • {asset.title()}: {trades_label(s['trades'])}, net {sign}₹{abs(s['net']):,.2f}\n"
+        if asset_lines:
+            asset_lines = f"📂 <b>By market:</b>\n{asset_lines}"
 
         msg = (
             f"📊 <b>DAILY REAL-WORLD P&L REPORT</b>\n"
@@ -233,11 +284,12 @@ class TelegramNotifier:
             f"✅ <b>Wins:</b> {summary.get('wins', 0)} | ❌ <b>Losses:</b> {summary.get('losses', 0)}\n"
             f"🎯 <b>Win Rate:</b> {summary.get('win_rate', 0)}%\n"
             f"💰 <b>Gross P&L:</b> <code>{gross_str}</code>\n"
-            f"🧾 <b>Brokerage & Taxes:</b> <code>-₹{total_charges:.2f}</code>\n"
+            f"🧾 <b>Brokerage & Taxes:</b> <code>-₹{total_charges:,.2f}</code>\n"
             f"{pnl_emoji} <b>Net Realized P&L:</b> <code>{net_str}</code>\n"
-            f"💼 <b>Closing Capital:</b> ₹{summary.get('capital', 10000) + net_pnl:,.2f}"
+            f"{asset_lines}"
+            f"💼 <b>Closing Capital:</b> ₹{closing_capital:,.2f}"
         )
-        self.send_message(msg)
+        self._send_alert(msg)
 
     def check_incoming_commands(self, command_handler: Callable[[str, str], str]):
         """

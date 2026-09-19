@@ -271,8 +271,7 @@ class CommodityThread(threading.Thread):
                     if not self.daily_report_sent:
                         print(f"[{time_str}] [CommodityThread] Dispatching Daily EOD Summary Report...")
                         state = self.daemon_ref.load_state()
-                        summary = self.daemon_ref.risk_manager.get_daily_summary()
-                        summary["total_pnl"] = state.get("total_pnl", 0.0)
+                        summary = self.daemon_ref.build_daily_summary(state)
                         self.daemon_ref.notifier.notify_daily_summary(summary)
                         self.daily_report_sent = True
                         print(f"[{time_str}] [CommodityThread] Daily session concluded! Master report sent to Telegram.")
