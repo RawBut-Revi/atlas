@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import Markdown from 'react-markdown';
 import { IsSetupComplete, Login, SetupAccount, GenerateTOTPSecret } from '../wailsjs/go/main/AuthService';
+import DripPanel from './DripPanel';
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -14,7 +15,7 @@ function App() {
   const [currentTime, setCurrentTime] = useState('');
 
   // Active Bottom Tab
-  const [activeTab, setActiveTab] = useState<'trading' | 'screener' | 'logs'>('trading');
+  const [activeTab, setActiveTab] = useState<'trading' | 'screener' | 'drip' | 'logs'>('trading');
 
   // Market data
   const [marketData, setMarketData] = useState<any[]>([]);
@@ -580,6 +581,12 @@ function App() {
                 FUNDAMENTAL SCREENER
               </button>
               <button 
+                onClick={() => setActiveTab('drip')}
+                className={`px-3 py-1 text-[11px] font-bold tracking-wider transition-colors ${activeTab === 'drip' ? 'bg-atlas-accent text-atlas-bg' : 'text-atlas-text-dim hover:text-white'}`}
+              >
+                DIVIDEND REINVESTMENT
+              </button>
+              <button 
                 onClick={() => setActiveTab('logs')}
                 className={`px-3 py-1 text-[11px] font-bold tracking-wider transition-colors ${activeTab === 'logs' ? 'bg-atlas-accent text-atlas-bg' : 'text-atlas-text-dim hover:text-white'}`}
               >
@@ -792,7 +799,10 @@ function App() {
             </div>
           )}
 
-          {/* TAB 3: SYSTEM LOGS */}
+          {/* TAB 3: DIVIDEND REINVESTMENT (DRIP) */}
+          {activeTab === 'drip' && <DripPanel onLog={addLog} />}
+
+          {/* TAB 4: SYSTEM LOGS */}
           {activeTab === 'logs' && (
             <div className="flex-1 overflow-auto p-2 text-[11px] font-mono text-atlas-green flex flex-col gap-1 bg-black/40">
               {logs.map((log, i) => (

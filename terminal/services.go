@@ -366,3 +366,77 @@ func (t *TradingService) ClosePosition(positionID string, exitPrice float64) (ma
 	return result, nil
 }
 
+
+// ─── DRIP (dividend reinvestment) Service ──────────────────────
+
+type DripService struct{}
+
+func NewDripService() *DripService {
+	return &DripService{}
+}
+
+// dripCall talks to the local Python API and turns its error responses (FastAPI "detail")
+// into Go errors, so the UI shows the real reason, e.g. "live orders are switched off".
+func dripCall(method, path string, payload interface{}, timeout time.Duration) (map[string]interface{}, error) {
+	client := &http.Client{Timeout: timeout}
+	url := "http://127.0.0.1:8000" + path
+
+	var resp *http.Response
+	var err error
+	if method == http.MethodGet {
+		resp, err = client.Get(url)
+	} else {
+		b, _ := json.Marshal(payload)
+		resp, err = client.Post(url, "application/json", bytes.NewReader(b))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("DRIP engine offline: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]interface{}
+	if jsonErr := json.Unmarshal(body, &result); jsonErr != nil {
+		return nil, fmt.Errorf("unexpected response from DRIP engine (HTTP %d)", resp.StatusCode)
+	}
+	if resp.StatusCode >= 400 {
+		if detail, ok := result["detail"].(string); ok {
+			return nil, fmt.Errorf("%s", detail)
+		}
+		return nil, fmt.Errorf("DRIP engine error (HTTP %d)", resp.StatusCode)
+	}
+	return result, nil
+}
+
+func dripRunPayload(mode string, confirm bool, maxDeploy float64, trackingStart string) map[string]interface{} {
+	p := map[string]interface{}{"mode": mode, "confirm": confirm, "max_deploy": maxDeploy}
+	if trackingStart != "" {
+		p["tracking_start"] = trackingStart
+	}
+	return p
+}
+
+func (d *DripService) GetDripStatus() (map[string]interface{}, error) {
+	return dripCall(http.MethodGet, "/api/drip/status", nil, 15*time.Second)
+}
+
+// PlanDrip is a dry run: it ranks stocks and shows the orders Atlas would place. Nothing is written.
+func (d *DripService) PlanDrip(mode string, maxDeploy float64, trackingStart string) (map[string]interface{}, error) {
+	return dripCall(http.MethodPost, "/api/drip/plan", dripRunPayload(mode, false, maxDeploy, trackingStart), 240*time.Second)
+}
+
+// ExecuteDrip places orders. Live mode additionally needs confirm=true and ATLAS_LIVE_DRIP=1 on the engine.
+func (d *DripService) ExecuteDrip(mode string, confirm bool, maxDeploy float64, trackingStart string) (map[string]interface{}, error) {
+	return dripCall(http.MethodPost, "/api/drip/execute", dripRunPayload(mode, confirm, maxDeploy, trackingStart), 240*time.Second)
+}
+
+func (d *DripService) SetDripKillSwitch(enabled bool) (map[string]interface{}, error) {
+	return dripCall(http.MethodPost, "/api/drip/kill", map[string]interface{}{"enabled": enabled}, 15*time.Second)
+}
+
+func (d *DripService) InitDripPortfolio(holdings map[string]int) (map[string]interface{}, error) {
+	return dripCall(http.MethodPost, "/api/drip/portfolio", map[string]interface{}{"holdings": holdings}, 15*time.Second)
+}
