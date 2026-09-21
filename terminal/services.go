@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -439,4 +440,52 @@ func (d *DripService) SetDripKillSwitch(enabled bool) (map[string]interface{}, e
 
 func (d *DripService) InitDripPortfolio(holdings map[string]int) (map[string]interface{}, error) {
 	return dripCall(http.MethodPost, "/api/drip/portfolio", map[string]interface{}{"holdings": holdings}, 15*time.Second)
+}
+
+// ─── Investment Scanner Service (paper only) ───────────────────
+
+type ScannerService struct{}
+
+func NewScannerService() *ScannerService {
+	return &ScannerService{}
+}
+
+// scannerCall reuses the local Python API plumbing and words engine errors for the scanner.
+func scannerCall(method, path string, payload interface{}, timeout time.Duration) (map[string]interface{}, error) {
+	res, err := dripCall(method, path, payload, timeout)
+	if err != nil {
+		return nil, fmt.Errorf("%s", strings.ReplaceAll(err.Error(), "DRIP engine", "Scanner engine"))
+	}
+	return res, nil
+}
+
+// GetScannerPicks returns ranked picks, weights, quality rejections and the backtest reference.
+func (s *ScannerService) GetScannerPicks() (map[string]interface{}, error) {
+	return scannerCall(http.MethodGet, "/api/scanner/picks", nil, 30*time.Second)
+}
+
+// GetScannerBacktest returns the stored point-in-time backtest and the variants that were tried.
+func (s *ScannerService) GetScannerBacktest() (map[string]interface{}, error) {
+	return scannerCall(http.MethodGet, "/api/scanner/backtest", nil, 60*time.Second)
+}
+
+// GetScannerStudy returns the same fixed model run on India-all and other markets.
+func (s *ScannerService) GetScannerStudy() (map[string]interface{}, error) {
+	return scannerCall(http.MethodGet, "/api/scanner/study", nil, 30*time.Second)
+}
+
+// GetScannerPortfolio returns the paper portfolio vs the 25%/yr line and Nifty.
+func (s *ScannerService) GetScannerPortfolio() (map[string]interface{}, error) {
+	return scannerCall(http.MethodGet, "/api/scanner/portfolio", nil, 30*time.Second)
+}
+
+// RebalanceScanner plans (execute=false) or applies (execute=true) a PAPER rebalance. No real orders.
+func (s *ScannerService) RebalanceScanner(execute bool, capital float64, force bool) (map[string]interface{}, error) {
+	return scannerCall(http.MethodPost, "/api/scanner/rebalance",
+		map[string]interface{}{"execute": execute, "capital": capital, "force": force}, 60*time.Second)
+}
+
+// RefreshScanner starts a background price refresh (1-2 minutes) and returns immediately.
+func (s *ScannerService) RefreshScanner() (map[string]interface{}, error) {
+	return scannerCall(http.MethodPost, "/api/scanner/refresh", map[string]interface{}{}, 15*time.Second)
 }

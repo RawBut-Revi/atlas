@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import Markdown from 'react-markdown';
 import { IsSetupComplete, Login, SetupAccount, GenerateTOTPSecret } from '../wailsjs/go/main/AuthService';
 import DripPanel from './DripPanel';
+import ScannerPanel from './ScannerPanel';
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -15,7 +16,7 @@ function App() {
   const [currentTime, setCurrentTime] = useState('');
 
   // Active Bottom Tab
-  const [activeTab, setActiveTab] = useState<'trading' | 'screener' | 'drip' | 'logs'>('trading');
+  const [activeTab, setActiveTab] = useState<'trading' | 'screener' | 'drip' | 'scanner' | 'logs'>('trading');
 
   // Market data
   const [marketData, setMarketData] = useState<any[]>([]);
@@ -587,6 +588,12 @@ function App() {
                 DIVIDEND REINVESTMENT
               </button>
               <button 
+                onClick={() => setActiveTab('scanner')}
+                className={`px-3 py-1 text-[11px] font-bold tracking-wider transition-colors ${activeTab === 'scanner' ? 'bg-atlas-accent text-atlas-bg' : 'text-atlas-text-dim hover:text-white'}`}
+              >
+                INVEST SCANNER
+              </button>
+              <button 
                 onClick={() => setActiveTab('logs')}
                 className={`px-3 py-1 text-[11px] font-bold tracking-wider transition-colors ${activeTab === 'logs' ? 'bg-atlas-accent text-atlas-bg' : 'text-atlas-text-dim hover:text-white'}`}
               >
@@ -801,6 +808,9 @@ function App() {
 
           {/* TAB 3: DIVIDEND REINVESTMENT (DRIP) */}
           {activeTab === 'drip' && <DripPanel onLog={addLog} />}
+
+          {/* TAB 3b: INVESTMENT SCANNER (paper) */}
+          {activeTab === 'scanner' && <ScannerPanel onLog={addLog} />}
 
           {/* TAB 4: SYSTEM LOGS */}
           {activeTab === 'logs' && (

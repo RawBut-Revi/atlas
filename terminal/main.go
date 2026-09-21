@@ -19,6 +19,7 @@ func main() {
 	chatService := NewChatService()
 	tradingService := NewTradingService()
 	dripService := NewDripService()
+	scannerService := NewScannerService()
 
 	err := wails.Run(&options.App{
 		Title:       "Project Atlas Terminal",
@@ -43,6 +44,7 @@ func main() {
 			chatService,
 			tradingService,
 			dripService,
+			scannerService,
 		},
 	})
 
