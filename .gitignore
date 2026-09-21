@@ -26,6 +26,17 @@ research/src/trading/authorized_users.json
 research/src/trading/alert_mode.json
 research/src/news_cache.json
 research/src/panic_state.json
+research/src/shadow_ledger.json
+
+# Investment scanner: price cache, stored backtest and the paper portfolio
+research/src/scanner_portfolio.json
+research/src/data/scanner_prices.json
+research/src/data/scanner_backtest.json
+
+# Multi-market study: per-stock history (tens of MB), universe lists and the study result
+research/src/data/markets/
+research/src/data/market_study.json
+research/src/data/walk_forward.json
 
 # DRIP runtime state (holdings, dividend ledger, kill switch)
 research/src/drip_portfolio.json
@@ -41,3 +52,6 @@ research/backtest_output/
 
 # Order-flow backtest: downloaded 1-minute NSE data
 research/nse_1min/
+
+# Local Claude Code skills (personal, not part of the bot)
+.claude/skills/
