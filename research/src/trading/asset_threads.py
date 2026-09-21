@@ -19,6 +19,7 @@ from datetime import datetime, time as dt_time
 import pytz
 
 from trading.neural_markov import GaussianMarketHMM
+from trading.entry_windows import entries_allowed
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -90,7 +91,11 @@ class EquityThread(threading.Thread):
                         self.daemon_ref.run_gap_scan()
                         self.gap_scanned_today = True
 
-                    self.daemon_ref.run_scan_cycle()
+                    # No new intraday entries before 10:00 (opening volatility); gap scan above is exempt.
+                    if entries_allowed("EQUITY", now_time):
+                        self.daemon_ref.run_scan_cycle()
+                    else:
+                        print(f"[{time_str}] [EquityThread] Entry blackout until 10:00 - managing positions only")
                     state = self.daemon_ref.load_state()
                     self.daemon_ref.manage_open_positions(state, asset_filter="EQUITY")
                     time.sleep(self.scan_interval)
@@ -106,7 +111,10 @@ class EquityThread(threading.Thread):
                 # 13:30 – 15:15: Afternoon Breakout Kill Zone
                 elif MARKET_AFTERNOON_START <= now_time <= MARKET_CLOSE:
                     print(f"\n[{time_str}] [EquityThread] ⚡ AFTERNOON BREAKOUT KILL ZONE (13:30-15:15)")
-                    self.daemon_ref.run_scan_cycle()
+                    if entries_allowed("EQUITY", now_time):
+                        self.daemon_ref.run_scan_cycle()
+                    else:
+                        print(f"[{time_str}] [EquityThread] Entry blackout after 15:00 - managing positions only")
                     state = self.daemon_ref.load_state()
                     self.daemon_ref.manage_open_positions(state, asset_filter="EQUITY")
                     time.sleep(self.scan_interval)
@@ -124,6 +132,7 @@ class EquityThread(threading.Thread):
 
                         state["open_positions"] = remaining
                         self.daemon_ref.save_state(state)
+                        self.daemon_ref.shadow_square_off("EQUITY")
                         self.equity_square_off_done = True
                         print(f"[{time_str}] [EquityThread] Equity square-off complete. Currency & MCX continue.")
                     time.sleep(30)
@@ -176,7 +185,8 @@ class CurrencyThread(threading.Thread):
 
                 # 09:00 – 16:45: Active FX Trading Window
                 if CURRENCY_OPEN <= now_time <= CURRENCY_SQUARE_OFF:
-                    self.daemon_ref.run_currency_scan()
+                    if entries_allowed("CURRENCY", now_time):
+                        self.daemon_ref.run_currency_scan()
                     state = self.daemon_ref.load_state()
                     self.daemon_ref.manage_open_positions(state, asset_filter="CURRENCY")
                     time.sleep(self.scan_interval)
@@ -194,6 +204,7 @@ class CurrencyThread(threading.Thread):
 
                         state["open_positions"] = remaining
                         self.daemon_ref.save_state(state)
+                        self.daemon_ref.shadow_square_off("CURRENCY")
                         self.currency_square_off_done = True
                         print(f"[{time_str}] [CurrencyThread] Currency square-off complete.")
                     time.sleep(30)
@@ -248,7 +259,8 @@ class CommodityThread(threading.Thread):
 
                 # 09:00 – 23:15: Active MCX Trading Window
                 if MCX_OPEN <= now_time <= MCX_SQUARE_OFF:
-                    self.daemon_ref.run_commodity_scan()
+                    if entries_allowed("COMMODITY", now_time):
+                        self.daemon_ref.run_commodity_scan()
                     state = self.daemon_ref.load_state()
                     self.daemon_ref.manage_open_positions(state, asset_filter="COMMODITY")
                     time.sleep(self.scan_interval)
@@ -266,6 +278,7 @@ class CommodityThread(threading.Thread):
 
                         state["open_positions"] = remaining
                         self.daemon_ref.save_state(state)
+                        self.daemon_ref.shadow_square_off("COMMODITY")
                         self.mcx_square_off_done = True
 
                     if not self.daily_report_sent:

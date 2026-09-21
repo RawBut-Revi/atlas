@@ -144,6 +144,34 @@ def fetch_historical_data(
         return None
 
 
+def fetch_intraday_last_price(symbol: str) -> Optional[float]:
+    """
+    Latest 1-minute close for `symbol` from Upstox (no auth needed).
+
+    The daily-candle endpoint above only carries completed days, so it can't serve as a live
+    price for open equity positions (they never moved and exited exactly at entry).
+    Returns None on any failure so callers can fall back.
+    """
+    inst_key = get_instrument_key(symbol) or UPSTOX_WATCHLIST.get(symbol)
+    if not inst_key:
+        return None
+
+    url = f"https://api.upstox.com/v3/historical-candle/intraday/{quote(inst_key, safe='')}/minutes/1"
+    try:
+        resp = requests.get(url, headers={"Accept": "application/json"}, timeout=10)
+        data = resp.json()
+        if data.get("status") != "success":
+            return None
+        candles = data["data"]["candles"]
+        if not candles:
+            return None
+        latest = max(candles, key=lambda c: c[0])  # ISO timestamps sort chronologically
+        return float(latest[4])
+    except Exception as e:
+        print(f"  [Backtest] Error fetching intraday price for {symbol}: {e}")
+        return None
+
+
 def run_backtest(
     symbol: str,
     months: int = 6,

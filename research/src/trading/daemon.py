@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from trading.universe import NSE_UNIVERSE, get_universe_symbols
 from trading.strategy import generate_signal
-from trading.backtest import fetch_historical_data
+from trading.backtest import fetch_historical_data, fetch_intraday_last_price
 from trading.risk import RiskManager, MARKET_OPEN, MARKET_CLOSE, SQUARE_OFF
 from trading.telegram_bot import TelegramNotifier
 from trading.gap_strategy import scan_for_gaps
@@ -36,6 +36,8 @@ from trading.commodity_strategy import (
 )
 from trading.patterns import analyze_3hour_patterns
 from trading.charges import calculate_trade_charges, passes_charges_filter, contract_multiplier, MIN_EDGE_MULTIPLE
+from trading.fills import entry_fill, exit_fill, rebase_levels, price_decimals, MAX_ENTRY_DRIFT_PCT
+from trading.shadow import ShadowLedger, build_report, MIN_TRADES_FOR_DECISION
 from trading import pnl_stats
 from trading.swing_radar import scan_swing_radar, get_swing_directional_bias, SwingObservation
 from trading.neural_markov import evaluate_trade_conviction, get_current_regime_status, RegimeState
@@ -60,6 +62,12 @@ TOP_INTRADAY_UNIVERSE = [
 # positions already open under these strategies are still managed and closed normally.
 DISABLED_STRATEGIES = frozenset({"INTRADAY", "US_SESSION_MOMENTUM", "GAP_FADE"})
 
+# Only (asset_type, strategy) pairs with a real sample and positive net (ex-COPPER, ex-JPYINR price
+# artifacts) open real paper positions: CURRENCY TREND_MOMENTUM 39/41 wins, 3H_PATTERN_BREAKOUT 14/15.
+# Everything else is tracked as a SHADOW twin (no margin, no charges) until it shows >= 30 trades of
+# positive net after charges + slippage in /shadow, then it can be added here.
+ALLOWED_LIVE = frozenset({("CURRENCY", "TREND_MOMENTUM"), ("CURRENCY", "3H_PATTERN_BREAKOUT")})
+
 # generate_signal() emits no "strategy" key; equity entries are labelled with this default.
 DEFAULT_EQUITY_STRATEGY = "INTRADAY"
 
@@ -81,6 +89,7 @@ class TradingDaemon:
         self.gap_scanned_today = False
         self.currency_square_off_done = False
         self.equity_square_off_done = False
+        self.shadow = ShadowLedger()
 
     def load_state(self) -> dict:
         with self.state_lock:
@@ -119,6 +128,11 @@ class TradingDaemon:
                     return float(candles[-1]["close"])
 
             else:  # EQUITY
+                # Daily candles only carry completed days, so equity positions never moved.
+                # Use the latest 1-minute close and fall back to daily only if that fails.
+                intraday = fetch_intraday_last_price(symbol)
+                if intraday is not None:
+                    return intraday
                 df = fetch_historical_data(symbol, from_date, today)
                 if df is not None and len(df) > 0:
                     if isinstance(df, list):
@@ -129,6 +143,37 @@ class TradingDaemon:
             pass
 
         return fallback_price
+
+    def _route_entry(self, new_pos: dict) -> bool:
+        """
+        Called once a trade has passed every entry gate. Always records the INVERSE twin (opposite bet).
+        Returns True if the caller should open the real paper position, False if this (asset, strategy)
+        is not allowed live yet, in which case it is tracked as a SHADOW twin instead.
+        """
+        self.shadow.record(new_pos, "INVERSE")
+        if (new_pos["asset_type"], new_pos["strategy"]) in ALLOWED_LIVE:
+            return True
+        self.shadow.record(new_pos, "SHADOW")
+        print(f"[Shadow] {new_pos['asset_type']} {new_pos['strategy']} {new_pos['direction']} {new_pos['symbol']}: "
+              f"not allowed live yet - tracked in shadow ledger only")
+        return False
+
+    def _equity_entry_levels(self, sig: dict):
+        """
+        Equity signals come from daily candles (entry = stale close). Fill at the live intraday price
+        and shift stop/targets by the same amount. Returns None (skip) if the setup drifted too far.
+        """
+        live = self.get_live_price(sig["symbol"], "EQUITY", fallback_price=0.0)
+        levels = {
+            "stop_loss": sig["stop_loss"],
+            "target_price": sig["target_price"],
+            "target_1": sig.get("target_1", sig["target_price"]),
+            "target_2": sig.get("target_2", sig["target_price"]),
+        }
+        rebased = rebase_levels(sig["direction"], sig["entry_price"], live, levels, "EQUITY")
+        if rebased is None:
+            print(f"[Daemon] Skipped {sig['symbol']}: live ₹{live:.2f} drifted >{MAX_ENTRY_DRIFT_PCT:g}% from signal entry ₹{sig['entry_price']:.2f}")
+        return rebased
 
     def calculate_margin_and_risk(self, state: dict) -> dict:
         """Calculates exact margin usage, free cash, and scenario risk exposure across open trades."""
@@ -703,6 +748,28 @@ class TradingDaemon:
             lines.append("⚠️ <i>Penny stocks are for multi-month/year delivery growth, NOT intraday leverage. Max 15% demat capital!</i>")
             return "\n".join(lines)
 
+        elif cmd == "/shadow":
+            sstate = self.shadow.load()
+            rows = build_report(sstate, state.get("trade_history", []))
+            live = ", ".join(f"{a} {s}" for a, s in sorted(ALLOWED_LIVE))
+            lines = [
+                f"🕶️ <b>SHADOW LEDGER</b> (since {str(sstate.get('since', 'n/a'))[:10]})",
+                f"━━━━━━━━━━━━━━━━━━━",
+                f"🟢 Live: <code>{live}</code>",
+                f"📂 {len(sstate.get('open_positions', []))} shadow twins open",
+                f"Bot = the bot's own trade (real or shadow). Inverse = the opposite bet on the same signal, "
+                f"same slippage and charges. Decisions need {MIN_TRADES_FOR_DECISION}+ paired trades.\n",
+            ]
+            if not rows:
+                lines.append("No completed pairs yet. Twins close on SL/TP or at session square-off.")
+            for r in rows:
+                badge = "🟢" if r["source"] == "LIVE" else "🕶️"
+                lines.append(
+                    f"{badge} <b>{r['segment']}</b> [{r['source']}] n={r['n']} | WR {r['signal_wr']}%\n"
+                    f"   Bot {pnl_stats.money(r['signal_net'])} | Inverse {pnl_stats.money(r['inverse_net'])} → <b>{r['verdict']}</b>"
+                )
+            return "\n".join(lines)
+
         elif cmd == "/help":
             return (
                 f"🤖 <b>ATLAS BOT COMMANDS</b>\n"
@@ -711,6 +778,7 @@ class TradingDaemon:
                 f"📊 /status — Capital, margin, risk & today's summary\n"
                 f"💰 /pnl — Today's P&L by market + latest trades\n"
                 f"📜 /report — All-time journal by market & strategy\n"
+                f"🕶️ /shadow — Shadow ledger: bot vs inverse (opposite bet) per strategy\n"
                 f"🔔 /quiet /mute /loud — Alert mode (silent / none / sound)\n"
                 f"🔭 /swing — Multi-Week Swing Observation Radar (1-4w)\n"
                 f"📊 /fno — Options & Futures swing trade simulations\n"
@@ -728,7 +796,7 @@ class TradingDaemon:
                 f"➕ /adduser &lt;id&gt; — Authorize new trading friend"
             )
 
-        return "Commands: /status, /positions, /pnl, /report, /alerts, /swing, /fno, /penny, /volatility, /patterns, /scan, /gaps, /currency, /commodities, /regime, /ai, /rl, /users, /help"
+        return "Commands: /status, /positions, /pnl, /report, /shadow, /alerts, /swing, /fno, /penny, /volatility, /patterns, /scan, /gaps, /currency, /commodities, /regime, /ai, /rl, /users, /help"
 
     # ─── 3. High-Speed Intraday Scanning (5-8 Seconds) ────────────
 
@@ -776,18 +844,34 @@ class TradingDaemon:
 
     # ─── 4. Position Management & Safe Exits ─────────────────────
 
-    def manage_open_positions(self, state: dict, asset_filter: str = None):
-        """Checks open positions against Stop Loss and Take Profit levels."""
+    def manage_open_positions(self, state: dict, asset_filter: str = None, shadow: bool = False):
+        """
+        Checks open positions against Stop Loss and Take Profit levels.
+        shadow=True manages a shadow-ledger state with the identical exit logic but no Telegram
+        notifications and no writes to paper_positions.json.
+        """
+        if not shadow:
+            self._manage_shadow(asset_filter)
+
         open_pos = state.get("open_positions", [])
         if not open_pos:
             return
 
         remaining = []
+        today_str = datetime.now().strftime("%Y-%m-%d")
         for p in open_pos:
             asset_type = p.get("asset_type", "EQUITY")
             # If asset_filter is specified, leave other asset positions untouched for their respective threads
             if asset_filter and asset_type != asset_filter:
                 remaining.append(p)
+                continue
+
+            # Every position here is intraday (MIS): one that outlived its session (daemon was down at
+            # square-off, e.g. SILVERMIC open 14 days) is closed, tagged so stats can exclude it.
+            entry_day = str(p.get("entry_time", ""))[:10]
+            if entry_day and entry_day < today_str:
+                print(f"[Daemon] Stale position {p['symbol']} (opened {p.get('entry_time')}) - closing")
+                self._close_position(state, p, "STALE_SQUARE_OFF", shadow=shadow)
                 continue
 
             try:
@@ -835,9 +919,16 @@ class TradingDaemon:
                         hit_sl = True
 
                 if hit_tp or hit_sl:
-                    exit_price = p["target_price"] if hit_tp else p["stop_loss"]
+                    # Targets are resting limit orders; stops fill at the worse of the level and the live
+                    # price (gap-through) plus slippage, so paper exits are no longer perfect fills.
+                    exit_price = exit_fill(
+                        p["direction"],
+                        p["target_price"] if hit_tp else p["stop_loss"],
+                        cur_price, asset_type,
+                        "TARGET" if hit_tp else "STOP",
+                    )
                     qty = p.get("lots", p.get("qty", 1))
-                    
+
                     chg = calculate_trade_charges(
                         p["symbol"], asset_type, p["direction"],
                         p["entry_price"], exit_price, qty_or_lots=qty
@@ -845,7 +936,7 @@ class TradingDaemon:
 
                     closed = {
                         **p,
-                        "exit_price": round(exit_price, 2),
+                        "exit_price": round(exit_price, price_decimals(asset_type)),
                         "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "gross_pnl": round(chg.gross_pnl, 2),
                         "charges": round(chg.total_charges, 2),
@@ -858,7 +949,8 @@ class TradingDaemon:
 
                     state.setdefault("trade_history", []).insert(0, closed)
                     state["total_pnl"] = round(state.get("total_pnl", 0.0) + chg.net_pnl, 2)
-                    self.notifier.notify_trade_closed(closed)
+                    if not shadow:
+                        self.notifier.notify_trade_closed(closed)
                     print(f"[Daemon] Position Closed: {p['symbol']} Gross: ₹{chg.gross_pnl:.2f} | Fees: ₹{chg.total_charges:.2f} | Net: ₹{chg.net_pnl:.2f} ({closed['status']})")
                 else:
                     remaining.append(p)
@@ -868,12 +960,49 @@ class TradingDaemon:
                 remaining.append(p)
 
         state["open_positions"] = remaining
-        self.save_state(state)
+        if shadow:
+            self.shadow.save(state)
+        else:
+            self.save_state(state)
 
-    def _close_position(self, state: dict, p: dict, status: str = "CLOSED"):
+    def _manage_shadow(self, asset_filter: str = None):
+        """Runs the shadow ledger through the same exit logic. The ledger lock is held for the whole
+        cycle so a concurrent record() can't be overwritten by this read-modify-write."""
+        ledger = getattr(self, "shadow", None)
+        if ledger is None:
+            return
+        try:
+            with ledger.lock:
+                sstate = ledger.load()
+                if sstate.get("open_positions"):
+                    self.manage_open_positions(sstate, asset_filter=asset_filter, shadow=True)
+        except Exception as e:
+            print(f"[Shadow] Error managing shadow positions: {e}")
+
+    def shadow_square_off(self, asset_type: str):
+        """Session-end close for shadow twins (mirrors the real square-off in each asset thread)."""
+        ledger = getattr(self, "shadow", None)
+        if ledger is None:
+            return
+        try:
+            with ledger.lock:
+                sstate = ledger.load()
+                keep = []
+                for p in sstate.get("open_positions", []):
+                    if p.get("asset_type") == asset_type:
+                        self._close_position(sstate, p, "SQUARE_OFF", shadow=True)
+                    else:
+                        keep.append(p)
+                sstate["open_positions"] = keep
+                ledger.save(sstate)
+        except Exception as e:
+            print(f"[Shadow] Error squaring off {asset_type} shadow positions: {e}")
+
+    def _close_position(self, state: dict, p: dict, status: str = "CLOSED", shadow: bool = False):
         """Closes a single position cleanly with real market price and statutory charges."""
         asset_type = p.get("asset_type", "EQUITY")
-        exit_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
+        live_price = self.get_live_price(p["symbol"], asset_type, fallback_price=p["entry_price"])
+        exit_price = exit_fill(p["direction"], live_price, live_price, asset_type, "MARKET")
         qty = p.get("lots", p.get("qty", 1))
 
         chg = calculate_trade_charges(
@@ -883,7 +1012,7 @@ class TradingDaemon:
 
         closed = {
             **p,
-            "exit_price": round(exit_price, 2),
+            "exit_price": round(exit_price, price_decimals(asset_type)),
             "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "gross_pnl": round(chg.gross_pnl, 2),
             "charges": round(chg.total_charges, 2),
@@ -895,7 +1024,8 @@ class TradingDaemon:
         }
         state.setdefault("trade_history", []).insert(0, closed)
         state["total_pnl"] = round(state.get("total_pnl", 0.0) + chg.net_pnl, 2)
-        self.notifier.notify_trade_closed(closed)
+        if not shadow:
+            self.notifier.notify_trade_closed(closed)
 
     def square_off_all(self, state: dict):
         """Force-closes all remaining open positions."""
@@ -996,6 +1126,10 @@ class TradingDaemon:
                     print(f"[Daemon] Skipped GAP {g['symbol']}: Required margin ₹{required_margin:.0f} > Free cash ₹{risk_metrics['free_margin']:.0f}")
                     continue
 
+                lv = self._equity_entry_levels(g)
+                if lv is None:
+                    continue
+
                 self.notifier.notify_signal_found(g)
 
                 pos_id = f"gap_{int(time.time()*1000)}"
@@ -1004,11 +1138,11 @@ class TradingDaemon:
                     "symbol": g["symbol"],
                     "direction": g["direction"],
                     "qty": qty,
-                    "entry_price": g["entry_price"],
-                    "stop_loss": g["stop_loss"],
-                    "target_price": g["target_price"],
-                    "target_1": g.get("target_1", g["target_price"]),
-                    "target_2": g.get("target_2", g["target_price"]),
+                    "entry_price": lv["entry_price"],
+                    "stop_loss": lv["stop_loss"],
+                    "target_price": lv["target_price"],
+                    "target_1": lv["target_1"],
+                    "target_2": lv["target_2"],
                     "mode": self.mode,
                     "asset_type": "EQUITY",
                     "strategy": g["strategy"],
@@ -1018,6 +1152,8 @@ class TradingDaemon:
                     "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "status": "OPEN",
                 }
+                if not self._route_entry(new_pos):
+                    continue
                 state.setdefault("open_positions", []).append(new_pos)
                 risk_metrics["free_margin"] -= required_margin
                 self.save_state(state)
@@ -1108,6 +1244,10 @@ class TradingDaemon:
                     print(f"[Daemon] Skipped {sig['symbol']}: Required margin ₹{required_margin:.0f} > Free cash ₹{risk_metrics['free_margin']:.0f}")
                     continue
 
+                lv = self._equity_entry_levels(sig)
+                if lv is None:
+                    continue
+
                 self.notifier.notify_signal_found(sig)
 
                 pos_id = f"eq_{int(time.time()*1000)}"
@@ -1116,11 +1256,11 @@ class TradingDaemon:
                     "symbol": sig["symbol"],
                     "direction": sig["direction"],
                     "qty": qty,
-                    "entry_price": sig["entry_price"],
-                    "stop_loss": sig["stop_loss"],
-                    "target_price": sig["target_price"],
-                    "target_1": sig.get("target_1", sig["target_price"]),
-                    "target_2": sig.get("target_2", sig["target_price"]),
+                    "entry_price": lv["entry_price"],
+                    "stop_loss": lv["stop_loss"],
+                    "target_price": lv["target_price"],
+                    "target_1": lv["target_1"],
+                    "target_2": lv["target_2"],
                     "mode": self.mode,
                     "asset_type": "EQUITY",
                     "strategy": sig.get("strategy", DEFAULT_EQUITY_STRATEGY),
@@ -1130,6 +1270,8 @@ class TradingDaemon:
                     "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "status": "OPEN",
                 }
+                if not self._route_entry(new_pos):
+                    continue
                 state.setdefault("open_positions", []).append(new_pos)
                 risk_metrics["free_margin"] -= required_margin
                 self.save_state(state)
@@ -1199,7 +1341,7 @@ class TradingDaemon:
                     "direction": sig["direction"],
                     "lots": lots,
                     "qty": lots,
-                    "entry_price": sig["entry_price"],
+                    "entry_price": entry_fill(sig["direction"], sig["entry_price"], "CURRENCY"),
                     "stop_loss": sig["stop_loss"],
                     "target_price": sig["target_price"],
                     "target_1": sig.get("target_1", sig["target_price"]),
@@ -1213,6 +1355,8 @@ class TradingDaemon:
                     "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "status": "OPEN",
                 }
+                if not self._route_entry(new_pos):
+                    continue
                 state.setdefault("open_positions", []).append(new_pos)
                 risk_metrics["free_margin"] -= pos_margin
                 self.save_state(state)
@@ -1283,7 +1427,7 @@ class TradingDaemon:
                     "direction": sig["direction"],
                     "lots": lots,
                     "qty": lots,
-                    "entry_price": sig["entry_price"],
+                    "entry_price": entry_fill(sig["direction"], sig["entry_price"], "COMMODITY"),
                     "stop_loss": sig["stop_loss"],
                     "target_price": sig["target_price"],
                     "target_1": sig.get("target_1", sig["target_price"]),
@@ -1297,6 +1441,8 @@ class TradingDaemon:
                     "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     "status": "OPEN",
                 }
+                if not self._route_entry(new_pos):
+                    continue
                 state.setdefault("open_positions", []).append(new_pos)
                 risk_metrics["free_margin"] -= pos_margin
                 self.save_state(state)
