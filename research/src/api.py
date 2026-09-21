@@ -25,6 +25,7 @@ from trading.backtest import fetch_historical_data, UPSTOX_WATCHLIST
 from trading.universe import NSE_UNIVERSE
 from trading.risk import RiskManager
 from scoring.drip_service import DripService, DripError
+from scoring.scanner_service import ScannerService, ScannerError
 
 app = FastAPI(title="Project Atlas API")
 
@@ -39,6 +40,7 @@ app.add_middleware(
 advisor = None
 risk_manager = RiskManager(capital=10000.0)
 drip = DripService()
+scanner = ScannerService()
 
 # In-memory store for paper/live trades and positions
 POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "paper_positions.json")
@@ -107,6 +109,12 @@ class DripInitRequest(BaseModel):
 
 class DripKillRequest(BaseModel):
     enabled: bool
+
+
+class ScannerRebalanceRequest(BaseModel):
+    execute: bool = False                  # False = plan only, writes nothing
+    capital: float = 150000.0              # paper capital, used only when creating the portfolio
+    force: bool = False                    # rebalance even if the monthly cycle is not due
 
 
 # ─── Health & AI Chat Endpoints ─────────────────────────────────
@@ -326,6 +334,55 @@ def drip_init_portfolio(req: DripInitRequest):
     """Creates the paper portfolio (refuses to overwrite an existing one)."""
     _drip_call(drip.init_paper_portfolio, req.holdings)
     return _drip_call(drip.status)
+
+
+
+
+# ─── Investment Scanner (paper only) ────────────────────────────
+
+def _scanner_call(fn, *a, **kw):
+    try:
+        return fn(*a, **kw)
+    except ScannerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Scanner failure: {type(e).__name__}: {e}")
+
+
+@app.get("/api/scanner/picks")
+def scanner_picks():
+    """Ranked picks with weights, quality rejections and the backtest reference. Uses cached prices."""
+    return _scanner_call(scanner.picks)
+
+
+@app.get("/api/scanner/backtest")
+def scanner_backtest(refresh: bool = False):
+    """Stored point-in-time backtest with the variants tried. refresh=true recomputes (a few seconds)."""
+    return _scanner_call(scanner.backtest_report, refresh)
+
+
+@app.get("/api/scanner/portfolio")
+def scanner_portfolio():
+    """Paper portfolio vs the 25%/yr line and Nifty."""
+    return _scanner_call(scanner.portfolio_status)
+
+
+@app.post("/api/scanner/rebalance")
+def scanner_rebalance(req: ScannerRebalanceRequest):
+    """Plan (execute=false) or apply (execute=true) a PAPER rebalance. Never places real orders."""
+    return _scanner_call(scanner.rebalance, req.execute, req.capital, req.force)
+
+
+@app.get("/api/scanner/study")
+def scanner_study():
+    """The same fixed model run on India-all and other markets: does its edge generalise? (run_market_study.py)"""
+    return _scanner_call(scanner.study_report)
+
+
+@app.post("/api/scanner/refresh")
+def scanner_refresh():
+    """Starts a background price refresh (1-2 min) and returns immediately."""
+    return _scanner_call(scanner.refresh_async)
 
 
 if __name__ == "__main__":

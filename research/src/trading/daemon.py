@@ -38,6 +38,8 @@ from trading.patterns import analyze_3hour_patterns
 from trading.charges import calculate_trade_charges, passes_charges_filter, contract_multiplier, MIN_EDGE_MULTIPLE
 from trading.fills import entry_fill, exit_fill, rebase_levels, price_decimals, MAX_ENTRY_DRIFT_PCT
 from trading.shadow import ShadowLedger, build_report, MIN_TRADES_FOR_DECISION
+from scoring.scanner_service import ScannerService, ScannerError
+from scoring.scanner_telegram import format_picks, format_status, format_plan, format_study
 from trading import pnl_stats
 from trading.swing_radar import scan_swing_radar, get_swing_directional_bias, SwingObservation
 from trading.neural_markov import evaluate_trade_conviction, get_current_regime_status, RegimeState
@@ -90,6 +92,14 @@ class TradingDaemon:
         self.currency_square_off_done = False
         self.equity_square_off_done = False
         self.shadow = ShadowLedger()
+        self._scanner = None
+
+    @property
+    def scanner(self) -> ScannerService:
+        """Investment scanner (lazy: it reads nothing until the first /invest)."""
+        if getattr(self, "_scanner", None) is None:
+            self._scanner = ScannerService()
+        return self._scanner
 
     def load_state(self) -> dict:
         with self.state_lock:
@@ -748,6 +758,24 @@ class TradingDaemon:
             lines.append("⚠️ <i>Penny stocks are for multi-month/year delivery growth, NOT intraday leverage. Max 15% demat capital!</i>")
             return "\n".join(lines)
 
+        elif cmd == "/invest" or cmd.startswith("/invest "):
+            arg = cmd[len("/invest"):].strip()
+            try:
+                if arg == "":
+                    return format_picks(self.scanner.picks())
+                if arg == "status":
+                    return format_status(self.scanner.portfolio_status())
+                if arg == "study":
+                    return format_study(self.scanner.study_report())
+                if arg == "refresh":
+                    started = self.scanner.refresh_async()["status"]
+                    return "🔄 Price refresh started (1-2 min). Run /invest again after." if started == "STARTED" else "🔄 A refresh is already running."
+                if arg in ("rebalance", "rebalance confirm"):
+                    return format_plan(self.scanner.rebalance(execute=(arg == "rebalance confirm")))
+                return "Usage: /invest | /invest status | /invest study | /invest refresh | /invest rebalance [confirm]"
+            except ScannerError as e:
+                return f"⚠️ {e}"
+
         elif cmd == "/shadow":
             sstate = self.shadow.load()
             rows = build_report(sstate, state.get("trade_history", []))
@@ -779,6 +807,7 @@ class TradingDaemon:
                 f"💰 /pnl — Today's P&L by market + latest trades\n"
                 f"📜 /report — All-time journal by market & strategy\n"
                 f"🕶️ /shadow — Shadow ledger: bot vs inverse (opposite bet) per strategy\n"
+                f"📈 /invest — Investment scanner: top stocks + paper portfolio vs 25% goal (/invest status, /invest study)\n"
                 f"🔔 /quiet /mute /loud — Alert mode (silent / none / sound)\n"
                 f"🔭 /swing — Multi-Week Swing Observation Radar (1-4w)\n"
                 f"📊 /fno — Options & Futures swing trade simulations\n"
@@ -796,7 +825,7 @@ class TradingDaemon:
                 f"➕ /adduser &lt;id&gt; — Authorize new trading friend"
             )
 
-        return "Commands: /status, /positions, /pnl, /report, /shadow, /alerts, /swing, /fno, /penny, /volatility, /patterns, /scan, /gaps, /currency, /commodities, /regime, /ai, /rl, /users, /help"
+        return "Commands: /status, /positions, /pnl, /report, /shadow, /invest, /alerts, /swing, /fno, /penny, /volatility, /patterns, /scan, /gaps, /currency, /commodities, /regime, /ai, /rl, /users, /help"
 
     # ─── 3. High-Speed Intraday Scanning (5-8 Seconds) ────────────
 
