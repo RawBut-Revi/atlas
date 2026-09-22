@@ -6,20 +6,24 @@ export function GetScannerBacktest() {
   return window['go']['main']['ScannerService']['GetScannerBacktest']();
 }
 
+export function GetScannerCompare() {
+  return window['go']['main']['ScannerService']['GetScannerCompare']();
+}
+
 export function GetScannerPicks() {
   return window['go']['main']['ScannerService']['GetScannerPicks']();
 }
 
-export function GetScannerPortfolio() {
-  return window['go']['main']['ScannerService']['GetScannerPortfolio']();
+export function GetScannerPortfolio(arg1) {
+  return window['go']['main']['ScannerService']['GetScannerPortfolio'](arg1);
 }
 
 export function GetScannerStudy() {
   return window['go']['main']['ScannerService']['GetScannerStudy']();
 }
 
-export function RebalanceScanner(arg1, arg2, arg3) {
-  return window['go']['main']['ScannerService']['RebalanceScanner'](arg1, arg2, arg3);
+export function RebalanceScanner(arg1, arg2, arg3, arg4) {
+  return window['go']['main']['ScannerService']['RebalanceScanner'](arg1, arg2, arg3, arg4);
 }
 
 export function RefreshScanner() {

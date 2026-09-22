@@ -81,13 +81,16 @@ def format_study(rep: Dict) -> str:
 
 
 def format_status(st: Dict) -> str:
+    variant = st.get("variant", "monthly")
+    label = st.get("label", "Monthly (default)")
     if st["status"] == "NO_PORTFOLIO":
-        return "💼 No paper portfolio yet. Send <code>/invest rebalance confirm</code> to create one (₹1,50,000 paper)."
+        cmd = "/invest rebalance confirm" if variant == "monthly" else f"/invest rebalance {variant} confirm"
+        return f"💼 No paper portfolio yet for {label}. Send <code>{cmd}</code> to create one (₹1,50,000 paper)."
     ann = f"{st['annualized_pct']:.1f}%" if st["annualized_pct"] is not None else st["annualized_note"]
     verdict = "🟢 ahead of" if st["on_track"] else "🔴 behind"
     nifty = "n/a" if st["nifty_return_pct"] is None else f"{st['nifty_return_pct']:+.2f}% (you {st['vs_nifty_pct']:+.2f}%)"
     lines = [
-        f"💼 <b>SCANNER PAPER PORTFOLIO</b> (day {st['days']})",
+        f"💼 <b>SCANNER PAPER PORTFOLIO</b> — {label} (day {st['days']})",
         "━━━━━━━━━━━━━━━━━━━",
         f"💰 ₹{st['value']:,.0f} from ₹{st['capital']:,.0f}: <b>{st['return_pct']:+.2f}%</b> | annualized: {ann}",
         f"🎯 {verdict} the 25%/yr line (needs ₹{st['hurdle_value']:,.0f}, gap {st['vs_hurdle']:+,.0f})",
@@ -97,6 +100,23 @@ def format_status(st: Dict) -> str:
     ]
     for h in st["holdings"]:
         lines.append(f"• <b>{h['symbol']}</b> {h['qty']} @ ₹{h['avg_cost']:,.2f} → ₹{h['price']:,.2f} ({h['pnl_pct']:+.1f}%)")
+    return "\n".join(lines)
+
+
+def format_compare(cmp: Dict) -> str:
+    """Monthly vs quarterly forward test, side by side. The comparison rule is shown every time so the
+    criterion can never be quietly changed once real numbers exist."""
+    lines = ["⚖️ <b>MONTHLY vs QUARTERLY (forward test)</b>", "━━━━━━━━━━━━━━━━━━━"]
+    for variant in ("monthly", "quarterly"):
+        st = cmp["variants"][variant]
+        if st["status"] != "OK":
+            lines.append(f"• <b>{st.get('label', variant)}</b>: {st['detail']}")
+            continue
+        ann = f"{st['annualized_pct']:.1f}%" if st["annualized_pct"] is not None else st["annualized_note"]
+        lines.append(f"• <b>{st['label']}</b> (day {st['days']}): {st['return_pct']:+.2f}% "
+                     f"(annualized {ann}) | max drawdown {st['max_drawdown_pct']:.1f}%")
+    lines.append(f"\n🏁 <b>{cmp['verdict']}</b>")
+    lines.append(f"\nRule (fixed before either had a result): {cmp['rule']}")
     return "\n".join(lines)
 
 

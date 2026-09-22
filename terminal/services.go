@@ -475,14 +475,28 @@ func (s *ScannerService) GetScannerStudy() (map[string]interface{}, error) {
 }
 
 // GetScannerPortfolio returns the paper portfolio vs the 25%/yr line and Nifty.
-func (s *ScannerService) GetScannerPortfolio() (map[string]interface{}, error) {
-	return scannerCall(http.MethodGet, "/api/scanner/portfolio", nil, 30*time.Second)
+// variant selects which tracked portfolio: "monthly" (default) or "quarterly" (forward test).
+func (s *ScannerService) GetScannerPortfolio(variant string) (map[string]interface{}, error) {
+	if variant == "" {
+		variant = "monthly"
+	}
+	q := url.Values{"variant": []string{variant}}
+	return scannerCall(http.MethodGet, "/api/scanner/portfolio?"+q.Encode(), nil, 30*time.Second)
+}
+
+// GetScannerCompare returns the monthly vs quarterly forward test, side by side, plus the fixed comparison rule.
+func (s *ScannerService) GetScannerCompare() (map[string]interface{}, error) {
+	return scannerCall(http.MethodGet, "/api/scanner/compare", nil, 30*time.Second)
 }
 
 // RebalanceScanner plans (execute=false) or applies (execute=true) a PAPER rebalance. No real orders.
-func (s *ScannerService) RebalanceScanner(execute bool, capital float64, force bool) (map[string]interface{}, error) {
+// variant selects which tracked portfolio: "monthly" (default) or "quarterly" (forward test).
+func (s *ScannerService) RebalanceScanner(execute bool, capital float64, force bool, variant string) (map[string]interface{}, error) {
+	if variant == "" {
+		variant = "monthly"
+	}
 	return scannerCall(http.MethodPost, "/api/scanner/rebalance",
-		map[string]interface{}{"execute": execute, "capital": capital, "force": force}, 60*time.Second)
+		map[string]interface{}{"execute": execute, "capital": capital, "force": force, "variant": variant}, 60*time.Second)
 }
 
 // RefreshScanner starts a background price refresh (1-2 minutes) and returns immediately.

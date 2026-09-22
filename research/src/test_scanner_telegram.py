@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 sys.stdout.reconfigure(encoding="utf-8")
 
 from scoring.scanner_service import ScannerError
-from scoring.scanner_telegram import format_picks, format_status, format_plan, format_study, backtest_line
+from scoring.scanner_telegram import format_picks, format_status, format_plan, format_study, format_compare, backtest_line
 from trading.daemon import TradingDaemon
 
 BT = {"first_date": "2015-09-25", "last_date": "2026-09-18", "cagr": 0.223, "max_drawdown": -0.235,
@@ -81,6 +81,19 @@ class TestFormatting(unittest.TestCase):
     def test_no_portfolio_tells_how_to_create_one(self):
         self.assertIn("/invest rebalance confirm", format_status({"status": "NO_PORTFOLIO"}))
 
+    def test_no_portfolio_for_a_named_variant_gives_the_variant_specific_command(self):
+        msg = format_status({"status": "NO_PORTFOLIO", "variant": "quarterly", "label": "Quarterly (forward test, started 2026-09-22)"})
+        self.assertIn("/invest rebalance quarterly confirm", msg)
+        self.assertIn("Quarterly", msg)
+
+    def test_status_shows_the_variant_label_when_present(self):
+        st = {"status": "OK", "variant": "quarterly", "label": "Quarterly (forward test, started 2026-09-22)",
+              "days": 5, "value": 150000.0, "capital": 150000.0, "return_pct": 0.0, "annualized_pct": None,
+              "annualized_note": "too early: needs 90+ days", "hurdle_value": 150100.0, "vs_hurdle": -100.0,
+              "on_track": False, "nifty_return_pct": None, "vs_nifty_pct": None, "max_drawdown_pct": 0.0,
+              "cash": 150000.0, "next_rebalance": "2026-12-21", "holdings": []}
+        self.assertIn("Quarterly (forward test", format_status(st))
+
     def test_plan_vs_executed_wording(self):
         plan = {"status": "PLAN", "portfolio_value": 150000.0, "est_costs": 300.0, "cash_after": 500.0,
                 "orders": [{"side": "BUY", "qty": 5, "symbol": "TCS", "price": 2400.0, "value": 12000.0}],
@@ -127,6 +140,36 @@ class TestStudyMessage(unittest.TestCase):
         self.assertIn("n/a", format_study(STUDY))
 
 
+RULE = "Pre-registered 2026-09-21: whichever of monthly/quarterly has the higher AFTER-COST return_pct wins."
+
+
+class TestCompareMessage(unittest.TestCase):
+    def test_shows_both_labels_and_the_verdict_and_the_rule(self):
+        cmp = {"variants": {
+            "monthly": {"status": "OK", "label": "Monthly (default)", "days": 60, "return_pct": 20.0,
+                       "annualized_pct": None, "annualized_note": "too early: needs 90+ days", "max_drawdown_pct": -2.0},
+            "quarterly": {"status": "OK", "label": "Quarterly (forward test, started 2026-09-22)", "days": 60,
+                         "return_pct": 5.0, "annualized_pct": None, "annualized_note": "too early: needs 90+ days",
+                         "max_drawdown_pct": -1.0}},
+            "rule": RULE, "min_days": 30, "verdict": "monthly ahead on after-cost return: monthly +20.00% vs quarterly +5.00%"}
+        msg = format_compare(cmp)
+        self.assertIn("Monthly (default)", msg)
+        self.assertIn("Quarterly (forward test", msg)
+        self.assertIn("monthly ahead", msg)
+        self.assertIn(RULE, msg)
+
+    def test_not_started_variant_shows_its_detail_instead_of_numbers(self):
+        cmp = {"variants": {
+            "monthly": {"status": "OK", "label": "Monthly (default)", "days": 10, "return_pct": 1.0,
+                       "annualized_pct": None, "annualized_note": "too early: needs 90+ days", "max_drawdown_pct": 0.0},
+            "quarterly": {"status": "NO_PORTFOLIO", "label": "Quarterly (forward test, started 2026-09-22)",
+                         "detail": "No paper portfolio yet. Rebalance with execute to create one."}},
+            "rule": RULE, "min_days": 30, "verdict": "not started yet: Quarterly (forward test, started 2026-09-22) has no portfolio"}
+        msg = format_compare(cmp)
+        self.assertIn("No paper portfolio yet", msg)
+        self.assertIn("not started yet", msg)
+
+
 class TestRouting(unittest.TestCase):
     def setUp(self):
         self.d = TradingDaemon.__new__(TradingDaemon)
@@ -141,6 +184,22 @@ class TestRouting(unittest.TestCase):
     def test_status_subcommand(self):
         self.d._scanner.portfolio_status.return_value = {"status": "NO_PORTFOLIO"}
         self.assertIn("No paper portfolio", self.d.handle_telegram_command("/invest status"))
+        self.d._scanner.portfolio_status.assert_called_with("monthly")
+
+    def test_status_quarterly_subcommand_passes_the_variant_through(self):
+        self.d._scanner.portfolio_status.return_value = {"status": "NO_PORTFOLIO", "variant": "quarterly",
+                                                         "label": "Quarterly (forward test, started 2026-09-22)"}
+        self.assertIn("Quarterly", self.d.handle_telegram_command("/invest status quarterly"))
+        self.d._scanner.portfolio_status.assert_called_with("quarterly")
+
+    def test_compare_subcommand(self):
+        self.d._scanner.compare_variants.return_value = {
+            "variants": {"monthly": {"status": "NO_PORTFOLIO", "label": "Monthly (default)",
+                                     "detail": "No paper portfolio yet."},
+                        "quarterly": {"status": "NO_PORTFOLIO", "label": "Quarterly (forward test, started 2026-09-22)",
+                                     "detail": "No paper portfolio yet."}},
+            "rule": "rule text", "min_days": 30, "verdict": "not started yet"}
+        self.assertIn("MONTHLY vs QUARTERLY", self.d.handle_telegram_command("/invest compare"))
 
     def test_refresh_is_non_blocking_and_reports_start(self):
         self.d._scanner.refresh_async.return_value = {"status": "STARTED"}
@@ -159,6 +218,22 @@ class TestRouting(unittest.TestCase):
                                                   "cash_after": 1.0, "orders": [], "note": "PAPER ONLY."}
         self.d.handle_telegram_command("/invest rebalance confirm")
         self.d._scanner.rebalance.assert_called_once_with(execute=True)
+
+    def test_rebalance_quarterly_without_confirm_only_plans_that_variant(self):
+        self.d._scanner.rebalance.return_value = {"status": "PLAN", "portfolio_value": 1.0, "est_costs": 0.0,
+                                                  "cash_after": 1.0, "orders": [], "note": "PAPER ONLY."}
+        self.d.handle_telegram_command("/invest rebalance quarterly")
+        self.d._scanner.rebalance.assert_called_once_with(execute=False, variant="quarterly")
+
+    def test_rebalance_quarterly_confirm_executes_that_variant(self):
+        self.d._scanner.rebalance.return_value = {"status": "EXECUTED", "portfolio_value": 1.0, "est_costs": 0.0,
+                                                  "cash_after": 1.0, "orders": [], "note": "PAPER ONLY."}
+        self.d.handle_telegram_command("/invest rebalance quarterly confirm")
+        self.d._scanner.rebalance.assert_called_once_with(execute=True, variant="quarterly")
+
+    def test_rebalance_with_garbage_after_confirm_shows_usage_not_a_crash(self):
+        self.assertIn("Usage: /invest", self.d.handle_telegram_command("/invest rebalance quarterly confirm now"))
+        self.d._scanner.rebalance.assert_not_called()
 
     def test_scanner_errors_become_a_friendly_message_not_a_crash(self):
         self.d._scanner.picks.side_effect = ScannerError("No price data yet.")

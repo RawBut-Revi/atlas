@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
-  GetScannerPicks, GetScannerPortfolio, GetScannerBacktest, GetScannerStudy, RebalanceScanner, RefreshScanner,
+  GetScannerPicks, GetScannerPortfolio, GetScannerBacktest, GetScannerStudy, GetScannerCompare,
+  RebalanceScanner, RefreshScanner,
 } from '../wailsjs/go/main/ScannerService';
 
 const inr = (n: number) => '₹' + (n ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
@@ -18,6 +19,8 @@ const tone = (v: number) => (v >= 0 ? 'text-atlas-green' : 'text-atlas-red');
 export default function ScannerPanel({ onLog }: { onLog: (msg: string) => void }) {
   const [picks, setPicks] = useState<any>(null);
   const [portfolio, setPortfolio] = useState<any>(null);
+  const [portfolioVariant, setPortfolioVariant] = useState<'monthly' | 'quarterly'>('monthly');
+  const [compare, setCompare] = useState<any>(null);
   const [backtest, setBacktest] = useState<any>(null);
   const [study, setStudy] = useState<any>(null);
   const [plan, setPlan] = useState<any>(null);
@@ -28,18 +31,29 @@ export default function ScannerPanel({ onLog }: { onLog: (msg: string) => void }
   const [showBacktest, setShowBacktest] = useState(false);
   const [showStudy, setShowStudy] = useState(false);
 
-  const load = useCallback(async () => {
-    setBusy('load');
-    const [p, pf, bt, st] = await Promise.allSettled([GetScannerPicks(), GetScannerPortfolio(), GetScannerBacktest(), GetScannerStudy()]);
-    if (p.status === 'fulfilled') { setPicks(p.value); setError(''); }
-    else { setPicks(null); setError(String((p.reason as any)?.message ?? p.reason)); }
-    if (pf.status === 'fulfilled') setPortfolio(pf.value);
-    if (bt.status === 'fulfilled') setBacktest(bt.value);
-    if (st.status === 'fulfilled') setStudy(st.value);
-    setBusy('');
+  const loadCompare = useCallback(async () => {
+    try { setCompare(await GetScannerCompare()); } catch { /* leave the last known comparison on screen */ }
   }, []);
 
+  const loadPortfolio = useCallback(async (variant: 'monthly' | 'quarterly') => {
+    try { setPortfolio(await GetScannerPortfolio(variant)); } catch { setPortfolio(null); }
+  }, []);
+
+  // Deliberately independent of portfolioVariant: this is the once-on-mount (and manual RELOAD/refresh) load.
+  // Switching the MONTHLY/QUARTERLY tab below only refetches that one portfolio, not the whole page.
+  const load = useCallback(async () => {
+    setBusy('load');
+    const [p, bt, st] = await Promise.allSettled([GetScannerPicks(), GetScannerBacktest(), GetScannerStudy()]);
+    if (p.status === 'fulfilled') { setPicks(p.value); setError(''); }
+    else { setPicks(null); setError(String((p.reason as any)?.message ?? p.reason)); }
+    if (bt.status === 'fulfilled') setBacktest(bt.value);
+    if (st.status === 'fulfilled') setStudy(st.value);
+    await loadCompare();
+    setBusy('');
+  }, [loadCompare]);
+
   useEffect(() => { load(); }, [load]);
+  useEffect(() => { loadPortfolio(portfolioVariant); setPlan(null); }, [portfolioVariant, loadPortfolio]);
 
   // While Yahoo prices refresh in the background, poll until they land.
   useEffect(() => {
@@ -63,15 +77,18 @@ export default function ScannerPanel({ onLog }: { onLog: (msg: string) => void }
     if (execute) {
       const n = plan?.orders?.length ?? 0;
       if (n === 0) { setError('Nothing to apply: run PLAN first and check there are orders.'); return; }
-      if (!window.confirm(`Apply ${n} PAPER order(s) to the scanner portfolio? (No real orders are placed.)`)) return;
+      if (!window.confirm(`Apply ${n} PAPER order(s) to the ${portfolioVariant} scanner portfolio? (No real orders are placed.)`)) return;
     }
     setBusy(execute ? 'exec' : 'plan'); setError(''); setNotice('');
     try {
-      const r = await RebalanceScanner(execute, capital, false);
+      const r = await RebalanceScanner(execute, capital, false, portfolioVariant);
       setPlan(r);
       if (r.status === 'NOT_DUE') setNotice(r.detail);
-      onLog(`Scanner rebalance ${execute ? 'apply' : 'plan'}: ${r.status}`);
-      if (execute && r.status === 'EXECUTED') { setNotice('Paper portfolio updated.'); setPlan(null); await load(); }
+      onLog(`Scanner rebalance ${execute ? 'apply' : 'plan'} (${portfolioVariant}): ${r.status}`);
+      if (execute && r.status === 'EXECUTED') {
+        setNotice('Paper portfolio updated.'); setPlan(null);
+        await loadPortfolio(portfolioVariant); await loadCompare();
+      }
     } catch (e: any) { setError(String(e?.message ?? e)); }
     setBusy('');
   };
@@ -175,7 +192,18 @@ export default function ScannerPanel({ onLog }: { onLog: (msg: string) => void }
 
         {/* Paper portfolio vs 25% goal */}
         <div className="w-[380px] border border-atlas-border">
-          <div className="px-2 py-1 bg-black/30 font-bold tracking-wider text-atlas-text-dim">PAPER PORTFOLIO vs 25% GOAL</div>
+          <div className="px-2 py-1 bg-black/30 font-bold tracking-wider text-atlas-text-dim flex items-center gap-2">
+            <span>PAPER PORTFOLIO vs 25% GOAL</span>
+            <div className="ml-auto flex gap-1">
+              {(['monthly', 'quarterly'] as const).map((v) => (
+                <button key={v} onClick={() => setPortfolioVariant(v)}
+                  className={`px-2 py-0.5 text-[10px] tracking-wider border ${portfolioVariant === v
+                    ? 'bg-atlas-accent text-atlas-bg border-atlas-accent' : 'border-atlas-border text-atlas-text-dim hover:text-white'}`}>
+                  {v.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
           {pf ? (
             <div className="p-2 flex flex-col gap-1">
               <div>Value <strong className="text-white">{inr(pf.value)}</strong> from {inr(pf.capital)} (day {pf.days})</div>
@@ -203,7 +231,7 @@ export default function ScannerPanel({ onLog }: { onLog: (msg: string) => void }
             </div>
           ) : (
             <div className="p-2 flex items-center gap-2 text-atlas-text-dim">
-              <span>No paper portfolio yet. Starting capital:</span>
+              <span>No {portfolio?.label ?? portfolioVariant} paper portfolio yet. Starting capital:</span>
               <input type="number" value={capital} min={10000} step={10000} onChange={(e) => setCapital(parseFloat(e.target.value) || 0)}
                 className="bg-atlas-bg border border-atlas-border px-1 py-0.5 w-24 text-white" />
             </div>
@@ -231,6 +259,38 @@ export default function ScannerPanel({ onLog }: { onLog: (msg: string) => void }
           )}
         </div>
       </div>
+
+      {/* Forward paper test: quarterly rebalance tracked alongside monthly, started 2026-09-22 because the
+          walk-forward study found quarterly beat monthly in both its fit and judge windows -- AFTER looking
+          at the judge window, so it's a hint, not a result. Always visible, not collapsed behind a click. */}
+      {compare && (
+        <div className="border border-atlas-border">
+          <div className="px-2 py-1 bg-black/30 font-bold tracking-wider text-atlas-text-dim">FORWARD TEST: MONTHLY vs QUARTERLY REBALANCE</div>
+          <div className="p-2 flex flex-col gap-2">
+            <div className="flex gap-4 flex-wrap">
+              {(['monthly', 'quarterly'] as const).map((v) => {
+                const s = compare.variants[v];
+                return (
+                  <div key={v} className="flex-1 min-w-[240px]">
+                    <div className="text-white font-bold">{s.label ?? v}</div>
+                    {s.status === 'OK' ? (
+                      <div className="text-atlas-text-dim">
+                        day {s.days}: <span className={tone(s.return_pct)}>{signed(s.return_pct, 2)}</span> after costs
+                        {' '}| annualized {s.annualized_pct !== null ? `${s.annualized_pct}%` : s.annualized_note}
+                        {' '}| max drawdown {s.max_drawdown_pct}%
+                      </div>
+                    ) : (
+                      <div className="text-atlas-text-dim">{s.detail}</div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            <div className="text-white">🏁 {compare.verdict}</div>
+            <div className="text-atlas-text-dim">Rule (fixed before either portfolio had a result): {compare.rule}</div>
+          </div>
+        </div>
+      )}
 
       {/* Multi-market study: does the same fixed model work outside India? */}
       {study && (

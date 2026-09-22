@@ -36,6 +36,27 @@ STALE_REFUSE_HOURS = 60.0        # weekend-safe: refuse to trade off prices olde
 MIN_DAYS_FOR_ANNUALIZED = 90     # an annualized return over a few weeks is noise
 MIN_TRADE_PCT = 0.01             # skip rebalance trades smaller than 1% of the portfolio
 
+# Forward paper test (decided 2026-09-21, started 2026-09-22): the walk-forward study found quarterly
+# rebalancing beat monthly in BOTH the fit and judge windows, but that was found AFTER looking at the judge
+# window, so it is a hint, not a result. "monthly" stays the default; "quarterly" runs alongside it as an
+# honest forward test. Only rebalance_days differs: everything else (signal, top_n, weighting) is identical.
+PORTFOLIO_VARIANTS: Dict[str, Dict] = {
+    "monthly": {"rebalance_days": 30, "label": "Monthly (default)"},
+    "quarterly": {"rebalance_days": 90, "label": "Quarterly (forward test, started 2026-09-22)"},
+}
+DEFAULT_VARIANT = "monthly"
+
+# Comparison rule, fixed BEFORE either portfolio has a result: the metric is AFTER-COST return_pct over the
+# same dates (both start the same day, so the window is always aligned), decided once both have at least
+# MIN_DAYS_FOR_COMPARISON days of history. Max drawdown is reported but is NOT the decider. Nothing else may
+# be substituted once real numbers exist.
+MIN_DAYS_FOR_COMPARISON = 30
+COMPARISON_RULE = (
+    "Pre-registered 2026-09-21: whichever of monthly/quarterly has the higher AFTER-COST return_pct once both "
+    "have >= 30 days of history wins. Max drawdown is reported alongside but does not decide it. No other "
+    "metric may be substituted after real results exist."
+)
+
 
 class ScannerError(Exception):
     """A refusal with a user-presentable reason."""
@@ -52,6 +73,7 @@ class ScannerService:
                  profile_refresher: Optional[Callable[[List[str]], None]] = None):
         data_dir = data_dir or os.path.join(HERE, "data")
         self.cfg = cfg
+        self.state_dir = state_dir
         self.market_dir = os.path.join(data_dir, "markets")
         self.study_path = os.path.join(data_dir, "market_study.json")
         self._universe_fn = universe_fn or (lambda: universe(LIVE_MARKET, market_dir=self.market_dir))
@@ -64,6 +86,19 @@ class ScannerService:
         self._fetchers = fetchers                   # () -> (stock_fn(ticker), nifty_fn()); injectable for tests
         self._refresh_lock = threading.Lock()
         self.refreshing = False
+
+    # ── portfolio variants ───────────────────────────────────────────────────
+    def _variant_cfg(self, variant: str) -> ScannerConfig:
+        if variant not in PORTFOLIO_VARIANTS:
+            raise ScannerError(f"Unknown portfolio variant '{variant}': choose from {', '.join(PORTFOLIO_VARIANTS)}")
+        return replace(self.cfg, rebalance_days=PORTFOLIO_VARIANTS[variant]["rebalance_days"])
+
+    def _portfolio_path(self, variant: str) -> str:
+        # "monthly" keeps the original filename so existing paper portfolios are unaffected.
+        if variant not in PORTFOLIO_VARIANTS:
+            raise ScannerError(f"Unknown portfolio variant '{variant}': choose from {', '.join(PORTFOLIO_VARIANTS)}")
+        return self.portfolio_path if variant == DEFAULT_VARIANT else \
+            os.path.join(self.state_dir, f"scanner_portfolio_{variant}.json")
 
     # ── small io helpers ─────────────────────────────────────────────────────
     @staticmethod
@@ -344,8 +379,8 @@ class ScannerService:
         n = blob.get("nifty")
         return float(n["close"][-1]) if n and n.get("close") else None
 
-    def _load_portfolio(self) -> Optional[Dict]:
-        return self._read(self.portfolio_path)
+    def _load_portfolio(self, variant: str = DEFAULT_VARIANT) -> Optional[Dict]:
+        return self._read(self._portfolio_path(variant))
 
     def _value(self, state: Dict, blob: Dict) -> float:
         total = state["cash"]
@@ -354,28 +389,33 @@ class ScannerService:
             total += h["qty"] * px
         return total
 
-    def rebalance(self, execute: bool = False, capital: float = 150000.0, force: bool = False) -> Dict:
-        """Plan (execute=False) or apply (execute=True) a paper rebalance to the current picks."""
+    def rebalance(self, execute: bool = False, capital: float = 150000.0, force: bool = False,
+                 variant: str = DEFAULT_VARIANT) -> Dict:
+        """Plan (execute=False) or apply (execute=True) a paper rebalance to the current picks.
+        `variant` selects which tracked portfolio (see PORTFOLIO_VARIANTS): each has its own state file and
+        its own rebalance cadence, everything else (signal, top_n, weighting) is identical."""
+        cfg = self._variant_cfg(variant)
         blob = self._prices()
         age = self.price_age_hours()
         if age is None or age > STALE_REFUSE_HOURS:
             self.refresh_async()
             raise ScannerError(f"Prices are {'missing' if age is None else f'{age:.0f}h old'}: refreshing in the background, try again in 2 minutes.")
 
-        state = self._load_portfolio()
+        state = self._load_portfolio(variant)
         today = _today()
         if state and not force:
-            due = date.fromisoformat(state["last_rebalance"]) + timedelta(days=self.cfg.rebalance_days)
+            due = date.fromisoformat(state["last_rebalance"]) + timedelta(days=cfg.rebalance_days)
             if today < due:
+                label = PORTFOLIO_VARIANTS[variant]["label"]
                 return {"status": "NOT_DUE", "next_due": due.isoformat(),
-                        "detail": f"Monthly strategy: next rebalance {due.isoformat()} (force=true overrides)."}
+                        "detail": f"{label}: next rebalance {due.isoformat()} (force=true overrides)."}
         if not state:
             if capital <= 0:
                 raise ScannerError("capital must be positive")
             state = {"created": today.isoformat(), "capital": float(capital), "cash": float(capital),
                      "holdings": {}, "last_rebalance": None, "nifty_start": None, "snapshots": [], "trades": []}
 
-        result = scan(blob["prices"], self._read(self.profile_path) or {}, self.cfg)
+        result = scan(blob["prices"], self._read(self.profile_path) or {}, cfg)
         total = self._value(state, blob)
         targets = {p["symbol"]: p["weight"] * total for p in result["picks"] if p["weight"] > 0}
 
@@ -394,7 +434,7 @@ class ScannerService:
             elif delta > 0:
                 buys.append({"symbol": sym, "side": "BUY", "qty": delta, "price": px})
 
-        cost_rate = self.cfg.cost_per_side
+        cost_rate = cfg.cost_per_side
         cash = state["cash"] + sum(o["qty"] * o["price"] * (1 - cost_rate) for o in sells)
         for o in sorted(buys, key=lambda o: -o["qty"] * o["price"]):
             affordable = int(cash // (o["price"] * (1 + cost_rate)))
@@ -432,7 +472,7 @@ class ScannerService:
         if state["nifty_start"] is None:
             state["nifty_start"] = self._nifty_last(blob)
         self._snapshot(state, blob)
-        self._write(self.portfolio_path, state)
+        self._write(self._portfolio_path(variant), state)
         return {**plan, "status": "EXECUTED"}
 
     def _snapshot(self, state: Dict, blob: Dict) -> None:
@@ -443,10 +483,12 @@ class ScannerService:
         else:
             state["snapshots"].append(snap)
 
-    def portfolio_status(self) -> Dict:
-        state = self._load_portfolio()
+    def portfolio_status(self, variant: str = DEFAULT_VARIANT) -> Dict:
+        cfg = self._variant_cfg(variant)
+        state = self._load_portfolio(variant)
         if not state:
-            return {"status": "NO_PORTFOLIO", "detail": "No paper portfolio yet. Rebalance with execute to create one.",
+            return {"status": "NO_PORTFOLIO", "variant": variant, "label": PORTFOLIO_VARIANTS[variant]["label"],
+                    "detail": "No paper portfolio yet. Rebalance with execute to create one.",
                     "target_annual_return": TARGET_ANNUAL_RETURN}
         blob = self._prices()
         value = self._value(state, blob)
@@ -460,7 +502,7 @@ class ScannerService:
         nifty_ret = nifty_now / nifty_start - 1.0 if nifty_now and nifty_start else None
 
         self._snapshot(state, blob)
-        self._write(self.portfolio_path, state)
+        self._write(self._portfolio_path(variant), state)
         peak, mdd = 0.0, 0.0
         for s in state["snapshots"]:
             peak = max(peak, s["value"])
@@ -473,9 +515,10 @@ class ScannerService:
             rows.append({"symbol": sym, "qty": h["qty"], "avg_cost": round(h["cost"] / h["qty"], 2), "price": px,
                          "value": round(h["qty"] * px, 2), "weight": round(h["qty"] * px / value, 4) if value else 0,
                          "pnl_pct": round((px / (h["cost"] / h["qty"]) - 1.0) * 100.0, 2)})
-        nxt = date.fromisoformat(state["last_rebalance"]) + timedelta(days=self.cfg.rebalance_days) if state.get("last_rebalance") else None
+        nxt = date.fromisoformat(state["last_rebalance"]) + timedelta(days=cfg.rebalance_days) if state.get("last_rebalance") else None
         return {
-            "status": "OK", "created": state["created"], "days": days, "capital": capital,
+            "status": "OK", "variant": variant, "label": PORTFOLIO_VARIANTS[variant]["label"],
+            "created": state["created"], "days": days, "capital": capital,
             "value": round(value, 2), "cash": round(state["cash"], 2), "return_pct": round(ret * 100.0, 2),
             "annualized_pct": None if annualized is None else round(annualized * 100.0, 2),
             "annualized_note": None if annualized is not None else f"too early: needs {MIN_DAYS_FOR_ANNUALIZED}+ days",
@@ -487,3 +530,27 @@ class ScannerService:
             "max_drawdown_pct": round(mdd * 100.0, 2), "next_rebalance": nxt.isoformat() if nxt else None,
             "holdings": rows,
         }
+
+    def compare_variants(self) -> Dict:
+        """
+        Monthly vs quarterly forward test, side by side. Judged by MIN_DAYS_FOR_COMPARISON / COMPARISON rule
+        above (after-cost return_pct, decided only once both have run long enough); nothing else decides it.
+        """
+        statuses = {v: self.portfolio_status(v) for v in PORTFOLIO_VARIANTS}
+        ready = {v: s for v, s in statuses.items() if s["status"] == "OK"}
+        verdict = None
+        if len(ready) < len(PORTFOLIO_VARIANTS):
+            missing = [v for v in PORTFOLIO_VARIANTS if v not in ready]
+            verdict = f"not started yet: {', '.join(PORTFOLIO_VARIANTS[v]['label'] for v in missing)} has no portfolio " \
+                      f"(rebalance it with execute=true to start the forward test)"
+        else:
+            days = min(s["days"] for s in ready.values())
+            if days < MIN_DAYS_FOR_COMPARISON:
+                verdict = f"not enough data yet: needs {MIN_DAYS_FOR_COMPARISON}+ days, have {days}"
+            else:
+                m, q = ready["monthly"], ready["quarterly"]
+                leader = "quarterly" if q["return_pct"] > m["return_pct"] else "monthly"
+                verdict = (f"{leader} ahead on after-cost return: monthly {m['return_pct']:+.2f}% vs "
+                          f"quarterly {q['return_pct']:+.2f}% over {days} days (drawdown monthly "
+                          f"{m['max_drawdown_pct']:.1f}% vs quarterly {q['max_drawdown_pct']:.1f}%, reported not deciding)")
+        return {"variants": statuses, "rule": COMPARISON_RULE, "min_days": MIN_DAYS_FOR_COMPARISON, "verdict": verdict}

@@ -61,6 +61,18 @@ class ServiceCase(unittest.TestCase):
         with open(self.svc.price_path, "w", encoding="utf-8") as fh:
             json.dump({"fetched_at": stamp, "prices": prices, "nifty": nifty}, fh)
 
+    def _age_portfolio(self, days, factor, variant="monthly"):
+        """Pretend the portfolio is `days` old and every holding's price moved by `factor`."""
+        path = self.svc._portfolio_path(variant)
+        state = _load(path)
+        state["created"] = (datetime.now(IST).date() - timedelta(days=days)).isoformat()
+        state["snapshots"] = []
+        _dump(path, state)
+        blob = _load(self.svc.price_path)
+        for sym in state["holdings"]:
+            blob["prices"][sym]["close"][-1] *= factor
+        _dump(self.svc.price_path, blob)
+
 
 class TestPricesAndPicks(ServiceCase):
     def test_picks_without_cache_explains_itself(self):
@@ -256,17 +268,6 @@ class TestPaperPortfolio(ServiceCase):
         self.assertEqual(st["hurdle_value"], 150000.0)
         self.assertEqual(st["nifty_return_pct"], 0.0)
 
-    def _age_portfolio(self, days, factor):
-        """Pretend the portfolio is `days` old and every holding's price moved by `factor`."""
-        state = _load(self.svc.portfolio_path)
-        state["created"] = (datetime.now(IST).date() - timedelta(days=days)).isoformat()
-        state["snapshots"] = []
-        _dump(self.svc.portfolio_path, state)
-        blob = _load(self.svc.price_path)
-        for sym in state["holdings"]:
-            blob["prices"][sym]["close"][-1] *= factor
-        _dump(self.svc.price_path, blob)
-
     def test_outperforming_the_25pct_hurdle_is_reported_as_on_track(self):
         self.write_prices()
         self.svc.rebalance(execute=True, capital=150000)
@@ -293,6 +294,93 @@ class TestPaperPortfolio(ServiceCase):
         _dump(self.svc.portfolio_path, state)
         st = self.svc.portfolio_status()
         self.assertLess(st["max_drawdown_pct"], -20.0)                  # 200k peak -> ~149k now
+
+
+class TestPortfolioVariants(ServiceCase):
+    """Forward paper test: quarterly scanner tracked alongside the default monthly one."""
+
+    def test_monthly_is_the_default_and_keeps_the_original_filename(self):
+        self.assertEqual(self.svc._portfolio_path("monthly"), self.svc.portfolio_path)
+
+    def test_quarterly_uses_a_separate_state_file(self):
+        self.assertNotEqual(self.svc._portfolio_path("quarterly"), self.svc.portfolio_path)
+        self.assertIn("quarterly", self.svc._portfolio_path("quarterly"))
+
+    def test_unknown_variant_is_a_friendly_error(self):
+        with self.assertRaises(ScannerError):
+            self.svc.rebalance(execute=True, capital=150000, variant="weekly")
+        with self.assertRaises(ScannerError):
+            self.svc.portfolio_status(variant="weekly")
+
+    def test_monthly_and_quarterly_are_independent_portfolios(self):
+        self.write_prices()
+        self.svc.rebalance(execute=True, capital=150000, variant="monthly")
+        self.svc.rebalance(execute=True, capital=150000, variant="quarterly")
+        self.assertTrue(os.path.exists(self.svc.portfolio_path))
+        self.assertTrue(os.path.exists(self.svc._portfolio_path("quarterly")))
+        m = self.svc.portfolio_status(variant="monthly")
+        q = self.svc.portfolio_status(variant="quarterly")
+        self.assertEqual(m["variant"], "monthly")
+        self.assertEqual(q["variant"], "quarterly")
+        self.assertIn("Quarterly", q["label"])
+
+    def test_quarterly_rebalance_waits_ninety_days_not_thirty(self):
+        self.write_prices()
+        for variant in ("monthly", "quarterly"):
+            self.svc.rebalance(execute=True, capital=150000, variant=variant)
+            path = self.svc._portfolio_path(variant)
+            state = _load(path)
+            state["last_rebalance"] = (datetime.now(IST).date() - timedelta(days=45)).isoformat()
+            _dump(path, state)
+        # 45 days since the last rebalance: overdue for monthly (needs 30), not yet for quarterly (needs 90)
+        self.assertEqual(self.svc.rebalance(execute=False, variant="monthly")["status"], "PLAN")
+        self.assertEqual(self.svc.rebalance(execute=False, variant="quarterly")["status"], "NOT_DUE")
+
+    def test_creating_quarterly_never_touches_the_monthly_file(self):
+        self.write_prices()
+        self.svc.rebalance(execute=True, capital=150000, variant="monthly")
+        before = _load(self.svc.portfolio_path)
+        self.svc.rebalance(execute=True, capital=200000, variant="quarterly")
+        after = _load(self.svc.portfolio_path)
+        self.assertEqual(before, after)
+
+    def test_compare_before_quarterly_exists_says_not_started(self):
+        self.write_prices()
+        self.svc.rebalance(execute=True, capital=150000, variant="monthly")
+        cmp = self.svc.compare_variants()
+        self.assertIn("not started", cmp["verdict"])
+        self.assertEqual(cmp["variants"]["monthly"]["status"], "OK")
+        self.assertEqual(cmp["variants"]["quarterly"]["status"], "NO_PORTFOLIO")
+
+    def test_compare_too_early_says_so_even_with_both_running(self):
+        self.write_prices()
+        self.svc.rebalance(execute=True, capital=150000, variant="monthly")
+        self.svc.rebalance(execute=True, capital=150000, variant="quarterly")
+        cmp = self.svc.compare_variants()
+        self.assertIn("not enough data", cmp["verdict"])
+
+    def test_compare_declares_a_leader_on_after_cost_return_once_ready(self):
+        # Both variants pick the same stocks from the same scan, so the shared price file can't tell them
+        # apart on its own; simulate diverging performance directly in each portfolio's saved cash/holdings.
+        self.write_prices()
+        self.svc.rebalance(execute=True, capital=150000, variant="monthly")
+        self.svc.rebalance(execute=True, capital=150000, variant="quarterly")
+        for variant, cash_factor in (("monthly", 1.20), ("quarterly", 1.05)):
+            path = self.svc._portfolio_path(variant)
+            state = _load(path)
+            state["created"] = (datetime.now(IST).date() - timedelta(days=60)).isoformat()
+            state["cash"], state["holdings"], state["snapshots"] = state["capital"] * cash_factor, {}, []
+            _dump(path, state)
+        cmp = self.svc.compare_variants()
+        self.assertIn("monthly ahead", cmp["verdict"])
+        self.assertGreater(cmp["variants"]["monthly"]["return_pct"], cmp["variants"]["quarterly"]["return_pct"])
+        self.assertAlmostEqual(cmp["variants"]["monthly"]["return_pct"], 20.0, places=1)
+        self.assertAlmostEqual(cmp["variants"]["quarterly"]["return_pct"], 5.0, places=1)
+
+    def test_comparison_rule_is_reported_and_fixed(self):
+        cmp = self.svc.compare_variants()
+        self.assertIn("Pre-registered", cmp["rule"])
+        self.assertEqual(cmp["min_days"], 30)
 
 
 def fake_study(**overrides):

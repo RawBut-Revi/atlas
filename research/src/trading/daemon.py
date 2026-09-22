@@ -38,8 +38,8 @@ from trading.patterns import analyze_3hour_patterns
 from trading.charges import calculate_trade_charges, passes_charges_filter, contract_multiplier, MIN_EDGE_MULTIPLE
 from trading.fills import entry_fill, exit_fill, rebase_levels, price_decimals, MAX_ENTRY_DRIFT_PCT
 from trading.shadow import ShadowLedger, build_report, MIN_TRADES_FOR_DECISION
-from scoring.scanner_service import ScannerService, ScannerError
-from scoring.scanner_telegram import format_picks, format_status, format_plan, format_study
+from scoring.scanner_service import ScannerService, ScannerError, PORTFOLIO_VARIANTS, DEFAULT_VARIANT
+from scoring.scanner_telegram import format_picks, format_status, format_plan, format_study, format_compare
 from trading import pnl_stats
 from trading.swing_radar import scan_swing_radar, get_swing_directional_bias, SwingObservation
 from trading.neural_markov import evaluate_trade_conviction, get_current_regime_status, RegimeState
@@ -760,19 +760,34 @@ class TradingDaemon:
 
         elif cmd == "/invest" or cmd.startswith("/invest "):
             arg = cmd[len("/invest"):].strip()
+            tokens = arg.split()
+            usage = ("Usage: /invest | /invest status [quarterly] | /invest compare | /invest study | "
+                     "/invest refresh | /invest rebalance [quarterly] [confirm]")
             try:
                 if arg == "":
                     return format_picks(self.scanner.picks())
-                if arg == "status":
-                    return format_status(self.scanner.portfolio_status())
+                if tokens[0] == "status":
+                    variant = tokens[1] if len(tokens) > 1 else DEFAULT_VARIANT
+                    return format_status(self.scanner.portfolio_status(variant))
+                if arg == "compare":
+                    return format_compare(self.scanner.compare_variants())
                 if arg == "study":
                     return format_study(self.scanner.study_report())
                 if arg == "refresh":
                     started = self.scanner.refresh_async()["status"]
                     return "🔄 Price refresh started (1-2 min). Run /invest again after." if started == "STARTED" else "🔄 A refresh is already running."
-                if arg in ("rebalance", "rebalance confirm"):
-                    return format_plan(self.scanner.rebalance(execute=(arg == "rebalance confirm")))
-                return "Usage: /invest | /invest status | /invest study | /invest refresh | /invest rebalance [confirm]"
+                if tokens[0] == "rebalance":
+                    rest = tokens[1:]
+                    variant = DEFAULT_VARIANT
+                    if rest and rest[0] in PORTFOLIO_VARIANTS:
+                        variant, rest = rest[0], rest[1:]
+                    if rest not in ([], ["confirm"]):
+                        return usage
+                    kwargs = {"execute": rest == ["confirm"]}
+                    if variant != DEFAULT_VARIANT:
+                        kwargs["variant"] = variant
+                    return format_plan(self.scanner.rebalance(**kwargs))
+                return usage
             except ScannerError as e:
                 return f"⚠️ {e}"
 
@@ -807,7 +822,8 @@ class TradingDaemon:
                 f"💰 /pnl — Today's P&L by market + latest trades\n"
                 f"📜 /report — All-time journal by market & strategy\n"
                 f"🕶️ /shadow — Shadow ledger: bot vs inverse (opposite bet) per strategy\n"
-                f"📈 /invest — Investment scanner: top stocks + paper portfolio vs 25% goal (/invest status, /invest study)\n"
+                f"📈 /invest — Investment scanner: top stocks + paper portfolio vs 25% goal "
+                f"(/invest status, /invest study, /invest compare — monthly vs quarterly forward test)\n"
                 f"🔔 /quiet /mute /loud — Alert mode (silent / none / sound)\n"
                 f"🔭 /swing — Multi-Week Swing Observation Radar (1-4w)\n"
                 f"📊 /fno — Options & Futures swing trade simulations\n"

@@ -28,8 +28,10 @@ research/src/news_cache.json
 research/src/panic_state.json
 research/src/shadow_ledger.json
 
-# Investment scanner: price cache, stored backtest and the paper portfolio
+# Investment scanner: price cache, stored backtest and the paper portfolios (monthly default +
+# quarterly forward test, see scoring/scanner_service.py PORTFOLIO_VARIANTS)
 research/src/scanner_portfolio.json
+research/src/scanner_portfolio_quarterly.json
 research/src/data/scanner_prices.json
 research/src/data/scanner_backtest.json
 

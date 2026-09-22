@@ -114,7 +114,8 @@ class DripKillRequest(BaseModel):
 class ScannerRebalanceRequest(BaseModel):
     execute: bool = False                  # False = plan only, writes nothing
     capital: float = 150000.0              # paper capital, used only when creating the portfolio
-    force: bool = False                    # rebalance even if the monthly cycle is not due
+    force: bool = False                    # rebalance even if the cycle is not due
+    variant: str = "monthly"               # "monthly" (default) or "quarterly" (forward test)
 
 
 # ─── Health & AI Chat Endpoints ─────────────────────────────────
@@ -362,21 +363,27 @@ def scanner_backtest(refresh: bool = False):
 
 
 @app.get("/api/scanner/portfolio")
-def scanner_portfolio():
-    """Paper portfolio vs the 25%/yr line and Nifty."""
-    return _scanner_call(scanner.portfolio_status)
+def scanner_portfolio(variant: str = "monthly"):
+    """Paper portfolio vs the 25%/yr line and Nifty. variant: 'monthly' (default) or 'quarterly' (forward test)."""
+    return _scanner_call(scanner.portfolio_status, variant)
 
 
 @app.post("/api/scanner/rebalance")
 def scanner_rebalance(req: ScannerRebalanceRequest):
     """Plan (execute=false) or apply (execute=true) a PAPER rebalance. Never places real orders."""
-    return _scanner_call(scanner.rebalance, req.execute, req.capital, req.force)
+    return _scanner_call(scanner.rebalance, req.execute, req.capital, req.force, req.variant)
 
 
 @app.get("/api/scanner/study")
 def scanner_study():
     """The same fixed model run on India-all and other markets: does its edge generalise? (run_market_study.py)"""
     return _scanner_call(scanner.study_report)
+
+
+@app.get("/api/scanner/compare")
+def scanner_compare():
+    """Monthly vs quarterly forward paper test, side by side, judged by a rule fixed before either had a result."""
+    return _scanner_call(scanner.compare_variants)
 
 
 @app.post("/api/scanner/refresh")
